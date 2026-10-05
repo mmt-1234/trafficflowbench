@@ -1,0 +1,6 @@
+# WSL/CUDA runtime tested on 2026-10-04 KST; install after requirements-model.txt.
+# Python 3.10 development headers and --no-build-isolation are required.
+einops==0.8.2
+ninja==1.13.2
+apache-tvm-ffi==0.1.9
+mamba-ssm @ git+https://github.com/state-spaces/mamba.git@e9594ce1c732d97440f0332fdc43170a2294dbfa

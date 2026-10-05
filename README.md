@@ -2,7 +2,7 @@
 
 **고속도로의 결측 교통 상태를 복원하고, 정체를 예측하며, 교통량의 물리적 일관성과 통행 수요까지 함께 평가하는 대회입니다.** 속도 예측 하나로 순위를 정하지 않고, 네 과제의 점수를 합산합니다.
 
-> 확인일: **2026-09-29, 한국시간(KST)**. Kaggle 현행 화면과 주최 측 공개 저장소를 조사한 참가 안내입니다. 변경 가능한 일정·규정은 제출 전에 다시 확인해 주세요. 이 폴더에는 대회 설명만 정리했으며 데이터와 모델 코드는 포함하지 않았습니다.
+> 확인일: **2026-09-29, 한국시간(KST)**. Kaggle 현행 화면과 주최 측 공개 저장소를 조사한 참가 안내입니다. 변경 가능한 일정·규정은 제출 전에 다시 확인해 주세요. 대회 데이터는 2026-10-01에 내려받아 Git에서 제외된 `data/`에 저장했으며, 모델 초기 구현은 11절에 안내합니다.
 
 | 항목 | 내용 |
 | --- | --- |
@@ -237,7 +237,7 @@ Task 4 베이스라인은 `f >= 0` 제약에서 `||Af-c||² + λ||f-b||²`를 �
 4. 전체 제출용으로는 validation·private 양쪽의 모든 대상에 대해 추론합니다.
 5. CSV 형식·누락·병합 경고를 확인하고 Kaggle에서 제출합니다.
 
-아래는 **실행 방법 안내**이며, 이 문서를 작성하면서 설치·학습·대회 제출을 수행한 것은 아닙니다. 공식 의존성은 pandas·NumPy·PyArrow·SciPy 등입니다. [실행 가이드](https://github.com/jacky850/trafficflowbench-public/blob/main/docs/RUN_LOCAL.md), [requirements.txt](https://github.com/jacky850/trafficflowbench-public/blob/main/requirements.txt)
+아래 공식 저장소 예제는 **실행 방법 안내**이며, 이 명령과 대회 제출은 실행하지 않았습니다. 11절의 소규모 모델 학습은 별도로 실행했습니다. 공식 의존성은 pandas·NumPy·PyArrow·SciPy 등입니다. [실행 가이드](https://github.com/jacky850/trafficflowbench-public/blob/main/docs/RUN_LOCAL.md), [requirements.txt](https://github.com/jacky850/trafficflowbench-public/blob/main/requirements.txt)
 
 ```bash
 git clone https://github.com/jacky850/trafficflowbench-public.git
@@ -311,4 +311,192 @@ IEEE 페이지는 대회 제안서를 요약한 소개이며, 최종 확인은 �
 
 코드 라이선스는 [MIT](https://github.com/jacky850/trafficflowbench-public/blob/main/LICENSE)이며, 데이터는 Kaggle의 **Subject to Competition Rules** 조건을 따릅니다. 두 조건을 동일한 것으로 간주하지 않습니다.
 
-조사 시 확인한 GitHub 커밋: [`c88cddf533bbf0afa4ff1fc6c031d760a08e7a31`](https://github.com/jacky850/trafficflowbench-public/commit/c88cddf533bbf0afa4ff1fc6c031d760a08e7a31). 문서 검증 범위는 공식 페이지·공개 코드 대조와 README 형식 검사입니다. 대회 데이터 다운로드, 모델 실행, Kaggle 점수 재현은 수행하지 않았습니다.
+조사 시 확인한 GitHub 커밋: [`c88cddf533bbf0afa4ff1fc6c031d760a08e7a31`](https://github.com/jacky850/trafficflowbench-public/commit/c88cddf533bbf0afa4ff1fc6c031d760a08e7a31). 문서 검증 범위는 공식 페이지·공개 코드 대조와 README 형식 검사입니다. 데이터 다운로드와 샘플 스키마 확인, 소규모 학습 실행은 2026-10-01에 수행했습니다. 이후 체크포인트 재평가와 GPU 측정 결과는 [2026-10-03 구현 점검](MODEL_AUDIT.md)에 정리했습니다. Kaggle 점수 재현은 수행하지 않았습니다.
+
+## 11. 모델 학습과 검증 사용법
+
+2026-10-04부터 기본 모델은 **공식 Mamba-2를 사용하는 v2**입니다. 31개 공개 입력 특징, 학습 가능한 노드·시간 임베딩, FFN·dropout·skip 출력층을 추가했습니다. `--graph`와 Physics 보조 손실은 비교 실험 옵션입니다. FAST의 시간 Attention–공간 Mamba–시간 Attention 순서를 유지한 대회용 적응 모델이며, 원논문 Mamba-1의 성능 재현을 뜻하지 않습니다. [구현 점검과 남은 실험](MODEL_AUDIT.md#2026-10-04-구현-반영)
+
+### 데이터와 WSL 환경
+
+Kaggle 규칙 동의와 API 인증 후 기존 다운로드 명령을 사용합니다. 캐시는 Git에서 제외한 `data/kagglehub_cache/`에 저장하고, 실제 경로는 `data/release_root.txt`에 기록합니다. [kagglehub 인증](https://github.com/Kaggle/kagglehub#authenticate)
+
+```powershell
+.venv\Scripts\python.exe src\download_data.py
+Get-Content data\release_root.txt
+```
+
+WSL 프로젝트는 `/home/parkj/projects/trafficflowbench`, 데이터는 그 아래 `data/kaggle_public`에 있습니다. Windows 폴더와 별도 복사본이므로 소스 변경은 자동 동기화되지 않습니다. 현재 WSL 환경에는 공식 Mamba-2와 CUDA PyTorch를 설치했습니다. 환경 재생성은 WSL에서 다음 순서로 진행합니다.
+
+```bash
+cd /home/parkj/projects/trafficflowbench
+sudo apt-get update
+sudo apt-get install -y python3.10-dev
+uv venv .venv --python 3.10
+uv pip install --python .venv/bin/python torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+uv pip install --python .venv/bin/python -r requirements-model.txt setuptools wheel packaging
+uv pip install --python .venv/bin/python --no-build-isolation -r requirements-mamba.txt
+.venv/bin/python -c "import torch; from mamba_ssm import Mamba2; print('CUDA:', torch.cuda.is_available())"
+```
+
+`requirements-mamba.txt`는 실제 실행한 공식 소스 커밋과 import 호환 버전을 고정합니다. `requirements-wsl.lock`은 검증 환경의 전체 설치 목록입니다. 기본 `mamba2`는 PyTorch convolution과 공식 Triton SSD scan을 사용합니다. `mamba1`은 별도 `selective_scan_cuda` 확장이 필요하며 이 환경에서는 실행을 검증하지 않았습니다. [고정한 공식 Mamba 소스](https://github.com/state-spaces/mamba/tree/e9594ce1c732d97440f0332fdc43170a2294dbfa)
+
+### 학습 시작과 진행 확인
+
+```bash
+cd /home/parkj/projects/trafficflowbench
+mkdir -p artifacts/v2
+nohup bash train_wsl.sh --epochs 75 >> artifacts/v2/train.log 2>&1 < /dev/null &
+tail -f artifacts/v2/train.log
+```
+
+State를 먼저 학습하고, 최선 State 인코더로 Queue를 초기화합니다. 기본값은 **최대 75 epoch**, 폭 64, 블록 2개, head 4개, dropout 0.1입니다. 1월 선택 지표가 5 epoch 동안 개선되지 않으면 조기 종료합니다. 반드시 75 epoch를 실행하려면 `--patience 0`을 추가합니다. 최초 실행에는 학습 기간 평균·정확한 마스크 대상의 캐시 생성과 Triton 커널 컴파일 시간이 필요합니다.
+
+새 파일은 `artifacts/v2/state.pt`·`queue.pt`에 저장하며, 이전 `artifacts/state.pt`·`queue.pt`와 구분합니다. `.pt`는 최선 모델, `.last.pt`는 최신 epoch 재개용입니다. `.jsonl`에는 진행과 학습 지표, `.epochN.json`에는 regime별 RMSE·Queue 조건별 IoU·비교 baseline·일자별 기록이 저장됩니다. `tail -f`의 `Ctrl+C`는 로그 보기만 종료합니다.
+
+GPU에서는 지원 시 BF16을 자동 적용하고 fused AdamW·고정 메모리·비동기 전송·다음 날짜 선처리를 사용합니다. State 기본 배치는 128링크 이하 8, 그 외 2이며, Queue는 각각 48·12입니다. Queue 창은 여러 날짜를 모아 배치를 채웁니다. `--precision fp32`, `--batch-size 4`, `--panel-batch D7_I405_N=2`, `--workers 0`으로 조정할 수 있습니다. 이전 9채널 모델의 GPU 비교 배율을 v2 성능으로 해석하지 마세요. [기존 측정 조건](MODEL_AUDIT.md#3-gpu-처리량을-더-높일-수-있는가)
+
+개별 실행과 재개 예시입니다. `--epochs`는 재개 전 epoch를 포함한 총 예산입니다. 데이터·모델·optimizer·scheduler·난수 상태를 복원하며 같은 학습 패널과 데이터를 요구합니다.
+
+```bash
+.venv/bin/python -u src/run.py train-state --release-root data/kaggle_public \
+  --checkpoint artifacts/v2/state.pt --epochs 75
+.venv/bin/python -u src/run.py train-queue --release-root data/kaggle_public \
+  --checkpoint artifacts/v2/queue.pt --init-state artifacts/v2/state.pt --epochs 75
+.venv/bin/python -u src/run.py train-state --release-root data/kaggle_public \
+  --checkpoint artifacts/v2/state.pt --resume artifacts/v2/state.last.pt --epochs 75
+```
+
+`train_wsl.sh`에는 `--resume`을 전달하지 않습니다. State·Queue 재개는 해당 명령에서 각각 실행합니다. 그래프·Physics·불확실성 옵션의 예시는 다음과 같습니다. 계수는 실험 시작값이며 공식 점수 개선을 검증한 값이 아닙니다.
+
+```bash
+.venv/bin/python -u src/run.py train-state --release-root data/kaggle_public \
+  --checkpoint artifacts/v2-physics/state.pt --graph \
+  --lambda-n 0.05 --lambda-dn 0.05 --lambda-fd 0.01
+.venv/bin/python -u src/run.py train-queue --release-root data/kaggle_public \
+  --checkpoint artifacts/v2-physics/queue.pt --init-state artifacts/v2-physics/state.pt \
+  --label-temperature 3 --uncertainty-margin 5
+```
+
+2026-10-04 추가한 결측 처리·학습 비중 조정은 다음 옵션으로 비교합니다. 새 학습은 사용자가 실행하며, 기존 점수보다 개선되는지는 아직 검증하지 않았습니다.
+
+```bash
+cd /home/parkj/projects/trafficflowbench
+mkdir -p artifacts/v2-improved
+nohup env CHECKPOINT_DIR=artifacts/v2-improved \
+  bash train_wsl.sh --epochs 10 --update-windows 0 \
+  --missing-aware --graph --graph-mode reliability \
+  >> artifacts/v2-improved/train.log 2>&1 < /dev/null &
+tail -f artifacts/v2-improved/train.log
+```
+
+- `--update-windows 0`: State는 8개, Queue는 48개 창의 기울기를 모아 한 번 업데이트합니다. GPU에 올리는 배치는 기존 `--batch-size`·`--panel-batch`를 따릅니다. 양수를 주면 과제에 관계없이 그 수를 사용하고, 옵션을 생략하면 기존 배치마다 업데이트합니다. epoch 끝의 남은 창도 실제 대상 수로 정규화해 업데이트하며 `updates_by_panel`에 횟수를 기록합니다. 패널의 창 수가 같을 때 배치 크기로 인한 업데이트 횟수 차이를 줄이는 기능이며, regime별 표본 비중까지 맞추지는 않습니다.
+- `--missing-aware`: 속도·교통량·점유율의 결측 위치에 각각 학습 가능한 임베딩을 넣고, 결측으로 표시된 채널의 수치는 입력 투영에서 제외합니다. 관측된 0은 관측값으로 유지합니다.
+- `--graph --graph-mode reliability`: 공개 물리 간선에서 채널별 관측 여부·관측률·결측 경과 시간과 양쪽 노드의 특징으로 집계 가중치를 학습합니다. 관측 채널이 전혀 없거나 관측률이 0인 이웃의 직접 메시지는 차단합니다. 데이터에서 새로운 간선을 학습하거나 MagiNet 전체 구조를 재현하는 옵션은 아닙니다. `--graph`만 쓰면 기존 평균 집계를 유지합니다.
+
+옵션 효과는 `--update-windows 0`만 적용한 실험과 결측·그래프 옵션까지 적용한 실험을 같은 seed·데이터·epoch 예산에서 비교해 확인합니다. 손실 누적 시 State는 전체 업데이트의 대상 셀 수, Queue는 전체 업데이트의 조건별 창 수로 정규화합니다. Physics 보조 항은 작은 배치별 값을 창 수 비율로 누적하므로 모든 창을 한 배치로 계산한 Physics 손실과 같다고 보장하지 않습니다.
+
+기존 v2 체크포인트는 계속 로드할 수 있습니다. `--resume`은 저장된 모델 구조와 `--update-windows` 설정을 복원하고, `--init-state`는 저장된 인코더 구조를 Queue에 전달합니다. 기존 체크포인트에 새 결측·그래프 구조를 켜도록 요청하면 오류로 안내하므로 새 구조는 별도 경로에서 학습합니다. 위 실험은 State → Queue 순서이며 각 작업 최대 10 epoch입니다. 충분한 비교에는 `--epochs 75`를 사용합니다. 실행 중인 모델은 이미 메모리에 올라간 구조를 계속 사용합니다.
+
+`train_wsl.sh`는 `flock`으로 같은 저장 폴더의 스크립트 중복 실행을 차단합니다. State와 Queue가 끝나면 잠금이 자동으로 해제됩니다. 수정 전에 시작된 작업과 `src/run.py`를 직접 실행한 작업에는 이 잠금이 적용되지 않습니다. 백그라운드 로그는 `>>`로 이어 써서 재실행 시 기존 내용을 지우지 않습니다.
+
+### Station 예측층·학습형 그래프·Wavelet 실험
+
+2026-10-05에 다음 네 옵션을 추가했습니다. 기존 기본값과 체크포인트는 유지하며, 새 구조는 **별도 경로에서 처음부터 학습**합니다. 기존 실행이 끝난 뒤 아래 명령을 사용합니다. State 다음 Queue를 자동으로 학습하며 각 작업의 최대 예산은 75 epoch, 기본 early stopping patience는 5입니다.
+
+```bash
+cd /home/parkj/projects/trafficflowbench
+mkdir -p artifacts/v2-wavelet
+nohup env CHECKPOINT_DIR=artifacts/v2-wavelet \
+  bash train_wsl.sh --epochs 75 --update-windows 0 \
+  --missing-aware --graph --graph-mode reliability \
+  --station-decoder gated --adaptive-graph-k 4 \
+  --wavelet-levels 2 --wavelet-input embedded --state-regime-balance \
+  >> artifacts/v2-wavelet/train.log 2>&1 < /dev/null &
+tail -f artifacts/v2-wavelet/train.log
+```
+
+| 옵션 | 반영한 동작 |
+| --- | --- |
+| `--station-decoder gated` | State station 문맥을 3→20채널로 확장합니다. 채널별 앞뒤 관측값·거리·유효성·현재 관측 여부·관측 품질·fit 평균을 작은 MLP와 게이트에 넣어 보간값의 보정량을 학습합니다. 처음 출력은 기존 보간값입니다. |
+| `--adaptive-graph-k 4` | 현재 패널의 노드 임베딩에서 방향별 관계를 학습하고 노드마다 자기 자신을 제외한 상위 4개 이웃만 집계합니다. 물리 간선과 별도 경로이므로 연결 성분 사이에도 정보를 전달합니다. 관측 품질을 반영하되 현재 결측인 노드의 시간 문맥도 사용할 수 있습니다. `0`은 비활성화, 활성화 값은 2 이상이며 실제 이웃 수는 노드 수−1 이하입니다. |
+| `--wavelet-levels 2` | Haar DWT 2단계로 추세와 두 변동 대역을 나누고 대역별 temporal convolution 후 inverse DWT로 합칩니다. `0`은 비활성화하며 1~3단계를 지원합니다. 위의 `--wavelet-input embedded`는 최초 실험 구조를 명시하며, 후속 관측 신호 경로는 아래에서 설명합니다. |
+| `--state-regime-balance` | 선택 구간을 사용하지 않고 fit 기간의 regime별 대상 셀 수로 SSE 가중치를 계산합니다. 패널 내 R1/R2/R3 MSE의 동일 비중을 목표로 학습하며, 검증 지표·검증 손실·템플릿은 바꾸지 않습니다. 없는 regime은 학습 가중치 계산에서 제외합니다. |
+
+Queue에는 새 인코더의 wavelet·물리 그래프·학습형 그래프를 전이합니다. station 예측층과 State regime 손실은 Queue에 적용하지 않습니다. Queue wavelet은 허용된 과거 12칸 안에서만 계산하며 forecast origin과 미래 관측을 입력하지 않습니다. 재개 시 모델 구조·regime 가중치 설정을 복원하고, State 제출 추론에서도 동일한 20채널 station 문맥을 생성합니다.
+
+[Graph WaveNet](https://arxiv.org/abs/1906.00121)의 학습형 관계와 [WavGCRN](https://arxiv.org/abs/2401.06040)의 주파수 대역 분리를 참고한 대회용 적용입니다. 두 논문의 전체 모델 재현은 아닙니다. Haar 변환은 PyTorch 연산으로 구현해 추가 패키지가 필요 없습니다. 학습형 그래프의 관계 점수는 패널 노드 수의 제곱에 비례해 계산하지만 시계열 메시지는 선택한 이웃만 집계합니다.
+
+위 명령은 실행 안내이며 전체 재학습을 수행했다는 뜻이 아닙니다. 점수·전체 epoch 시간·GPU 사용률 개선은 미검증입니다. 같은 seed·분할·업데이트 설정에서 옵션을 하나씩 추가한 비교와 최종 조합을 함께 평가합니다. [구현·검증 기록](MODEL_AUDIT.md#2026-10-05-station-예측층학습형-그래프wavelet-추가)
+
+### 진단 후 수정: 관측 신호 Wavelet·채널별 예측층
+
+2026-10-05의 [성능 진단](PERFORMANCE_DIAGNOSIS.md)에 따라 세 가지를 수정했습니다. 새 구조는 별도 저장 폴더에서 처음부터 학습합니다. 현재 실행 중인 Queue 작업은 시작할 때 읽은 기존 구조로 계속 동작합니다.
+
+| 수정 | 동작 |
+| --- | --- |
+| `--wavelet-input signals` | 정규화된 속도·차로당 교통량·점유율 3채널에만 DWT를 적용합니다. 결측은 해당 채널의 fit 평균으로 채우며 관측된 0은 유지합니다. 복원 후 은닉 차원으로 투영해 합칩니다. 시각·요일·노드·상대 시점 임베딩과 결측 토큰은 기존 주 경로에 유지하고 DWT에는 넣지 않습니다. |
+| `--station-decoder split` | State 속도와 교통량에 각각 독립 MLP·보정 게이트를 사용합니다. 공통 인코더·20채널 station 문맥·처음 출력이 보간값인 성질은 유지합니다. `gated`는 공유 MLP 비교용으로 남겼습니다. 게이트 값을 강제로 높이거나 교통량 보정을 제거하지 않습니다. |
+| station 전처리 배열화 | station별 Python 반복을 제거하고 `[시간, station]` 배열에서 앞뒤 관측 위치·보간값·시간 거리·유효성을 함께 계산합니다. 관측 창 밖 값을 참조하지 않으며 기존 3채널과 20채널 문맥 모두 같은 계약을 유지합니다. |
+
+다음 명령은 **터미널에 진행 로그를 표시하면서 파일에도 저장**합니다. State 이후 새 State 인코더를 전달한 Queue를 순서대로 학습합니다. 각 작업은 최대 75 epoch이며 기본 patience는 5입니다. 전면 실행이므로 `Ctrl+C`는 이 학습을 중단합니다.
+
+```bash
+cd /home/parkj/projects/trafficflowbench
+mkdir -p artifacts/v2-signal-split
+env CHECKPOINT_DIR=artifacts/v2-signal-split \
+  bash train_wsl.sh --epochs 75 --seed 42 --update-windows 0 \
+  --missing-aware --graph --graph-mode reliability \
+  --station-decoder split --adaptive-graph-k 4 \
+  --wavelet-levels 2 --wavelet-input signals --state-regime-balance \
+  2>&1 | tee -a artifacts/v2-signal-split/train.log
+```
+
+새 학습에서 `--wavelet-input`을 생략하면 `signals`를 사용합니다. `--resume`·`--init-state`에서는 체크포인트 설정을 그대로 상속하며, 이전 체크포인트에 해당 필드가 없으면 `embedded`로 복원합니다. 구조가 다른 옵션을 명시하면 오류로 차단합니다. 새 구조로 바꾸기 위해 기존 체크포인트를 그대로 재개할 수는 없습니다. State station 예측층과 regime 손실은 Queue에 적용하지 않습니다.
+
+공유 예측층과 regime 손실 중 무엇이 교통량에 영향을 주는지 확인하려면 나머지 설정·분할·seed·업데이트 수를 고정하고, 각 행을 다른 저장 폴더에서 비교합니다. 단독 State 비교는 위 옵션을 `src/run.py train-state`에 전달하면 됩니다.
+
+| 비교 | `--station-decoder` | `--wavelet-input` | `--state-regime-balance` |
+| --- | --- | --- | --- |
+| 기존 구조 | `gated` | `embedded` | 사용 |
+| Wavelet 위치만 변경 | `gated` | `signals` | 사용 |
+| 예측층만 분리 | `split` | `embedded` | 사용 |
+| 두 구조 변경 | `split` | `signals` | 사용 |
+| regime 손실 영향 | `split` | `signals` | 생략 |
+
+전처리는 위 비교 모두에 적용합니다. 실제 공개 2개 패널의 하루 24개 창에서 기존·새 특징과 문맥이 정확히 같았고, 20채널 전처리 중앙값은 81-station에서 **7.60→2.85ms**, 352-station에서 **31.53→9.32ms**였습니다. 같은 입력을 메모리에 둔 11회 교대 측정이며 기존 Queue 학습이 함께 실행 중이었습니다. 파일 읽기·전체 epoch 시간·점수 개선을 측정한 값은 아닙니다. [측정 결과](artifacts/signal-split-check/results.json), [재현 스크립트](artifacts/signal-split-check/verify.py), [검증 기록](MODEL_AUDIT.md#2026-10-05-진단-후-세-가지-수정)
+
+### 선택 구간과 2월 잠금 평가
+
+학습은 2030년 6~12월, 선택은 2031년 1월입니다. State는 배포된 `mainline_states_masked`와 Task 1 train 템플릿의 **정확한 대상 셀**을 사용합니다. 선택 지표는 RMSE 기반 State를 regime·방향·도로군으로 집계합니다. Queue는 공개 관측으로 만든 대리 라벨에서 onset·ongoing을 패널·도로군별로 집계하며, 정상 유지 창의 오탐과 미래 속도 RMSE도 기록합니다.
+
+```bash
+.venv/bin/python src/run.py evaluate --release-root data/kaggle_public \
+  --checkpoint artifacts/v2/state.pt --period holdout \
+  --output reports/state-february.json --bootstrap 1000
+.venv/bin/python src/run.py evaluate --release-root data/kaggle_public \
+  --checkpoint artifacts/v2/queue.pt --period holdout \
+  --output reports/queue-february.json --bootstrap 1000
+.venv/bin/python src/run.py validate-odme --release-root data/kaggle_public \
+  --split validation --lambdas 0.01 0.05 0.2 --output reports/odme-lambda.json
+```
+
+`holdout`에서는 저장된 Queue 임계값을 고정하고 재선택하지 않습니다. bootstrap은 같은 일자를 재추출한 모델–baseline 차이의 구간입니다. State baseline은 같은 대상의 시간 보간·fit 구간 링크별 요일/시간 평균이며, 공식 station별 과거 평균 baseline과 완전히 같은 구현은 아닙니다. `physics_aux_normalized_mse`는 N·dN·FD 학습 항의 진단이며 공식 Physics 점수가 아닙니다. ODME의 숨긴 관측 링크 RMSE도 공개 데이터로 만든 대리 지표입니다.
+
+### 제출과 실행 검사
+
+공식 저장소는 외부 체크아웃으로 사용합니다. 체크포인트를 생략하면 공식 State 과거 평균·Queue persistence와 NNLS를 조합합니다. 전체 대상 패널을 학습한 후 모델 체크포인트를 지정합니다.
+
+```bash
+.venv/bin/python src/run.py submit --official-root /path/to/trafficflowbench-public \
+  --release-root data/kaggle_public --output-dir reports/model \
+  --state-checkpoint artifacts/v2/state.pt --queue-checkpoint artifacts/v2/queue.pt
+```
+
+`--state-checkpoint`·`--queue-checkpoint`를 반복하면 State 연속값·Queue 확률을 각각 평균합니다. 여러 seed는 `--seed`와 별도 저장 경로로 학습합니다. 단일 패널 실행 점검 모델로 전체 제출을 만들지 않습니다. 공식 병합의 누락 경고가 없어야 최종 `submission.csv`를 확정합니다.
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+이전 9채널 체크포인트의 1월 재평가 값은 State 정규화 MSE 0.009547, Queue 대리 IoU 0.4548입니다. 새 v2와 다른 마스크·라벨·집계 조건이므로 직접 성능 비교하지 않습니다. 전체 v2 학습·여러 seed 성능 비교·Kaggle 점수 재현은 아직 수행하지 않았습니다. [검증 기록](MODEL_AUDIT.md)

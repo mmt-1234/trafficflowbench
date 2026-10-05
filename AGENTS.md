@@ -6,20 +6,26 @@
 
 - `README.md`: 대회 개요, 데이터 구성, 평가 방식, 제출 절차와 공식 출처를 담습니다.
 - `AGENTS.md`: 문서 작성 및 검증 규칙을 정의합니다.
+- `MODEL_PLAN.md`: FAST형 모델 구성과 검증 계획을 담습니다.
+- `src/`: 초기 모델, 데이터 변환, 학습·추론·병합 명령을 담습니다.
+- `tests/`: 데이터 계약에 관한 작은 합성 입력 검사를 담습니다.
+- `requirements-model.txt`: 모델 실행에 필요한 Python 패키지를 적습니다.
+- `data/`: `kagglehub` 다운로드 캐시와 실제 release-root 경로를 담으며 Git에서 제외합니다.
 
-현재 소스 코드, 테스트, 데이터, 이미지 자산 디렉터리는 없습니다. README의 `src/`, `config/`, `kaggle_public/` 경로는 주최 측 저장소 또는 배포 데이터의 구조이며, 이 폴더에 존재하는 경로가 아닙니다.
+대회 데이터는 Git에서 제외한 `data/kagglehub_cache/`에 있습니다. 공식 저장소의 `config/`와 `src/`는 이 폴더에 없습니다. README 7절의 공식 `src/` 명령은 주최 측 저장소에서 실행하고, 11절의 `src/run.py`는 이 폴더에서 실행합니다.
 
 ## 개발 및 검증 명령
 
-현재 설치, 빌드, 개발 서버 명령은 없습니다. 프로젝트 루트에서 다음 명령으로 문서를 확인해 주세요.
+개발 서버는 없습니다. 프로젝트 루트에서 다음 명령으로 문서와 코드를 확인해 주세요.
 
 ```bash
 rg --files --hidden                       # 파일 구성 확인
-rg -n '^#{1,3} ' README.md AGENTS.md        # 제목 계층 확인
-rg -n '[[:blank:]]+$' README.md AGENTS.md   # 줄 끝 공백 탐지
+rg -n '^#{1,3} ' README.md MODEL_PLAN.md AGENTS.md
+rg -n '[[:blank:]]+$' README.md MODEL_PLAN.md AGENTS.md src tests
+python -m unittest discover -s tests -v
 ```
 
-마지막 명령은 공백이 없으면 출력 없이 종료 코드 1을 반환합니다. README의 Python 명령은 별도로 준비한 공식 저장소와 데이터가 필요합니다.
+공백 탐지 명령은 공백이 없으면 출력 없이 종료 코드 1을 반환합니다. 합성 입력 단위 검사는 NumPy·pandas가 필요하고, 학습·제출 명령은 별도로 준비한 공식 저장소·대회 데이터·`requirements-model.txt`의 패키지가 필요합니다.
 
 ## 작성 스타일과 이름 규칙
 
@@ -35,7 +41,7 @@ rg -n '[[:blank:]]+$' README.md AGENTS.md   # 줄 끝 공백 탐지
 
 ## 커밋 및 PR 지침
 
-현재 `.git`이 없어 기존 커밋 관례를 확인할 수 없습니다. Git 도입 시 `docs: 제출 절차 설명 보완`처럼 변경 목적을 드러내는 커밋 제목을 권장합니다.
+현재 Git 기록에서 확립된 커밋 관례는 확인되지 않았습니다. `docs: 제출 절차 설명 보완`처럼 변경 목적을 드러내는 커밋 제목을 권장합니다.
 
 PR에는 변경 이유, 수정한 항목, 근거 링크, 수행한 검사와 미실행 사유를 적어 주세요. 관련 이슈가 있으면 연결하고, 표나 배치가 달라졌다면 미리보기 이미지를 첨부해 주세요.
 
