@@ -483,6 +483,42 @@ env CHECKPOINT_DIR=artifacts/v2-signal-split \
 
 `holdout`에서는 저장된 Queue 임계값을 고정하고 재선택하지 않습니다. bootstrap은 같은 일자를 재추출한 모델–baseline 차이의 구간입니다. State baseline은 같은 대상의 시간 보간·fit 구간 링크별 요일/시간 평균이며, 공식 station별 과거 평균 baseline과 완전히 같은 구현은 아닙니다. `physics_aux_normalized_mse`는 N·dN·FD 학습 항의 진단이며 공식 Physics 점수가 아닙니다. ODME의 숨긴 관측 링크 RMSE도 공개 데이터로 만든 대리 지표입니다.
 
+### Task 4: 가중 Prior NNLS
+
+Task 4는 해당 split의 관측 링크만 희소 행렬로 읽고 다음 문제를 풉니다. 기본값 `p=0`, `λ=0.05`는 기존 정규화 NNLS와 같은 목적함수입니다. 데이터 다운로드나 신경망 학습은 수행하지 않습니다.
+
+```text
+minimize over f >= 0: ||A_measured f - c_measured||² + λ sum_i (f_i-b_i)² / v_i
+v_i = (b_i + τ)^p / median_k((b_k + τ)^p), p in {0, 1, 2}
+τ = prior_floor_ratio * median(positive b), default prior_floor_ratio = 0.1
+```
+
+`p=0`은 같은 절대오차, `p=1`은 Prior에 비례하는 오차 분산, `p=2`는 비슷한 상대오차를 가정합니다. Prior가 모두 0이면 양수 중앙값 대신 1을 사용하며, `v_i`도 모두 1입니다. Prior가 0인 경로도 양수로 수정할 수 있습니다. 우선 `p=0`에서 λ를 비교하고 이후 아래처럼 오차 가정을 확장합니다.
+
+```bash
+.venv/bin/python src/run.py validate-odme --release-root data/kaggle_public \
+  --split validation --lambdas 0.01 0.05 0.2 --prior-powers 0 1 2 \
+  --prior-floor-ratio 0.1 --repeats 3 --seed 42 \
+  --output reports/odme-weighted.json
+```
+
+매 반복에서 관측 링크의 약 20%를 숨기고 모든 후보에 같은 분할을 적용합니다. Prior 그대로와 `λ=0.05, p=0`은 항상 비교에 포함합니다. 보고서에는 숨긴 링크의 정규화 L1 오차·RMSE, Prior 이동량 L1·L2, Prior 대비 목적지 분포 변화, 0으로 추정한 경로 비율을 기록합니다. 반복 평균을 패널별로 계산한 뒤 방향·도로군을 동일 가중으로 집계하며, 반복별 L1 오차의 표준편차와 최악 패널도 표시합니다. 이 표준편차는 신뢰구간이 아닙니다.
+
+`structure`에는 관측되지 않는 경로, 관측 링크 조합이 같은 경로, OD당 경로 수를 기록합니다. 동일 관측 조합이 없더라도 모든 경로가 식별된다는 뜻은 아닙니다. `destination_distribution_l1_from_prior`는 Prior와의 변화량이며 정답 기반 `S_attr`가 아닙니다. 총교통량이 0인 분포의 비교는 `null`입니다. `best_proxy_candidate`는 숨긴 링크 L1 오차가 가장 작은 후보로, 전체 `S_ODME`의 최선이나 성능 개선을 보장하지 않습니다. 보고서의 `proxy_only`는 항상 `true`이며, 선택 결과를 제출 설정에 자동 적용하지 않습니다.
+
+Task 4 예측만 저장하려면 아래 명령을 사용합니다. `--prior-power`와 `--odme-lambda`는 직접 선택한 값으로 바꾸며, 전체 관측 링크를 사용해 다시 풉니다. `--panel`은 작은 패널만 확인할 때 반복 지정할 수 있습니다. Prior 자체의 CSV는 `--prior-only`로 저장합니다.
+
+```bash
+.venv/bin/python src/run.py predict-odme --release-root data/kaggle_public \
+  --split validation --odme-lambda 0.05 --prior-power 0 \
+  --output reports/odme-validation.csv
+.venv/bin/python src/run.py predict-odme --release-root data/kaggle_public \
+  --split private --odme-lambda 0.05 --prior-power 0 \
+  --output reports/odme-private.csv
+```
+
+출력은 `sample_submission_path_flow.csv`의 키·구역·행 순서를 유지하는 과제별 CSV입니다. Kaggle 업로드 전에는 다른 과제와 함께 병합해야 합니다. 전체 `submit` 명령에서도 `--odme-lambda`, `--odme-prior-power`, `--odme-prior-floor-ratio`로 같은 설정을 전달할 수 있습니다. 가중 모델의 실제 데이터 성능과 실행 시간은 미측정입니다.
+
 ### 제출과 실행 검사
 
 공식 저장소는 외부 체크아웃으로 사용합니다. 체크포인트를 생략하면 공식 State 과거 평균·Queue persistence와 NNLS를 조합합니다. 전체 대상 패널을 학습한 후 모델 체크포인트를 지정합니다.

@@ -240,13 +240,18 @@ def predict_queue(release: Path, split: str, checkpoint: Path, output: Path) -> 
 
 
 def odme_problem(release: Path, name: str, split: str):
+    from scipy.sparse import csr_matrix
     network = release / "corridors" / name / "network"
     root = release / "task4" / name / split
     template = pd.read_csv(root / "sample_submission_path_flow.csv", dtype=str)
+    if template.empty or template[ODME_COLUMNS[:-1]].isna().any().any():
+        raise ValueError(f"Empty or incomplete ODME template: {name} {split}")
+    if not template.panel.eq(name).all() or template.departure_time.nunique() != 1:
+        raise ValueError(f"Mismatched ODME template period/panel: {name} {split}")
     if template[ODME_KEYS].duplicated().any() or template.path_id.duplicated().any():
         raise ValueError(f"Duplicate ODME template paths: {name} {split}")
     counts = pd.read_csv(root / "synthetic_link_counts.csv", dtype={"link_id": str})
-    prior = pd.read_csv(root / "synthetic_weak_prior.csv", dtype={"path_id": str})
+    prior = pd.read_csv(root / "synthetic_weak_prior.csv", dtype={"path_id": str, "departure_time": str})
     incidence = pd.read_csv(network / "path_link_incidence.csv", dtype={"path_id": str, "link_id": str})
     paths = template.path_id.tolist()
     measured = counts.dropna(subset=["count"])
@@ -257,78 +262,191 @@ def odme_problem(release: Path, name: str, split: str):
         raise ValueError(f"No measured ODME links: {name} {split}")
     row = {link: i for i, link in enumerate(measured.link_id)}
     column = {path: i for i, path in enumerate(paths)}
-    matrix = np.zeros((len(row), len(column)), dtype=np.float64)
-    for record in incidence.itertuples(index=False):
-        if record.link_id in row and record.path_id in column:
-            matrix[row[record.link_id], column[record.path_id]] = 1.0
-    base = pd.to_numeric(prior.set_index("path_id").path_flow.reindex(paths), errors="coerce").fillna(0).to_numpy(dtype=np.float64)
+    included = incidence[incidence.link_id.isin(row) & incidence.path_id.isin(column)]
+    matrix = csr_matrix((np.ones(len(included)),
+                         (included.link_id.map(row), included.path_id.map(column))),
+                        shape=(len(row), len(column)))
+    matrix.data[:] = 1.0  # Repeated incidence rows still mean one traversal.
+    prior_values = pd.to_numeric(prior.path_flow, errors="coerce").to_numpy(dtype=np.float64)
+    if not np.isfinite(prior_values).all() or (prior_values < 0).any():
+        raise ValueError(f"Invalid ODME prior: {name} {split}")
+    if "departure_time" in prior and not prior.departure_time.eq(template.departure_time.iloc[0]).all():
+        raise ValueError(f"Mismatched ODME prior period: {name} {split}")
+    base = pd.Series(prior_values, index=prior.path_id).reindex(paths, fill_value=0).to_numpy(dtype=np.float64)
     observed = pd.to_numeric(measured["count"], errors="coerce").to_numpy(dtype=np.float64)
     if not np.isfinite(observed).all() or not np.isfinite(base).all() or (observed < 0).any() or (base < 0).any():
         raise ValueError(f"Invalid counts/prior: {name} {split}")
     return template, matrix, observed, base
 
 
-def solve_odme(matrix, observed, base, lam):
+def odme_prior_variance(base, power=0, floor_ratio=0.1):
+    base = np.asarray(base, dtype=np.float64)
+    if base.ndim != 1 or not base.size or not np.isfinite(base).all() or (base < 0).any():
+        raise ValueError("ODME prior must be a nonempty finite nonnegative vector")
+    if power not in (0, 1, 2) or not np.isfinite(floor_ratio) or floor_ratio <= 0:
+        raise ValueError("ODME prior power must be 0, 1, or 2, and floor ratio must be positive")
+    if power == 0:
+        return np.ones_like(base)
+    positive = base[base > 0]
+    scale = float(np.median(positive)) if positive.size else 1.0
+    variance = (base / scale + floor_ratio) ** power
+    variance /= np.median(variance)
+    if not np.isfinite(variance).all() or (variance <= 0).any():
+        raise ValueError("ODME prior variance is outside the numerical range")
+    return variance
+
+
+def solve_odme(matrix, observed, base, lam, prior_power=0, prior_floor_ratio=0.1):
     from scipy.optimize import lsq_linear, minimize
     from scipy.sparse import csr_matrix
     if lam < 0 or not np.isfinite(lam):
         raise ValueError("ODME lambda must be finite and nonnegative")
-    design = csr_matrix(matrix)
+    variance = odme_prior_variance(base, prior_power, prior_floor_ratio)
+    base = np.asarray(base, dtype=np.float64)
+    observed = np.asarray(observed, dtype=np.float64)
+    design = csr_matrix(matrix, dtype=np.float64)
+    if (observed.ndim != 1 or not observed.size or design.shape != (len(observed), len(base))
+            or not np.isfinite(observed).all() or (observed < 0).any()
+            or not np.isfinite(design.data).all() or (design.data < 0).any()):
+        raise ValueError("Invalid ODME matrix/count dimensions or values")
     if lam == 0:
         result = lsq_linear(design, observed, bounds=(0, np.inf), tol=1e-8, max_iter=2000)
         if not result.success:
             raise RuntimeError(f"ODME solver did not converge: {result.message}")
         return result.x
-    # Solve the equivalent dual over measured links (100), not paths (5,050).
-    # Clipping recovers the constrained primal; its duality gap certifies the fit.
+    precision = lam / variance
+    if not np.isfinite(precision).all() or (precision <= 0).any():
+        raise ValueError("ODME prior precision is outside the numerical range")
+    # The dual has one variable per measured link, independent of path count.
     def objective(dual):
-        flow = np.maximum(base - np.asarray(design.T @ dual).ravel() / lam, 0)
-        cost = 0.5 * (dual @ dual) + observed @ dual + 0.5 * lam * (flow @ flow - base @ base)
+        flow = np.maximum(base - np.asarray(design.T @ dual).ravel() / precision, 0)
+        cost = 0.5 * (dual @ dual) + observed @ dual + 0.5 * np.dot(precision * (flow - base), flow + base)
         return cost, dual + observed - design @ flow
     result = minimize(objective, np.zeros(len(observed)), jac=True, method="BFGS",
                       options={"gtol": 1e-5, "maxiter": 2000})
-    flow = np.maximum(base - np.asarray(design.T @ result.x).ravel() / lam, 0)
+    flow = np.maximum(base - np.asarray(design.T @ result.x).ravel() / precision, 0)
     residual, difference = design @ flow - observed, flow - base
-    primal = 0.5 * (residual @ residual + lam * (difference @ difference))
-    if not np.isfinite(flow).all() or abs(primal + result.fun) > 1e-7 * (1 + primal):
+    primal = 0.5 * (residual @ residual + np.dot(precision * difference, difference))
+    # Clipped flows minimize the Lagrangian; this gap avoids subtracting large costs.
+    gap = 0.5 * np.sum((result.x - residual) ** 2)
+    if not np.isfinite(flow).all() or not np.isfinite(primal + gap) or gap > 1e-7 * (1 + primal):
         raise RuntimeError(f"ODME solver did not converge: {result.message}")
     return flow
 
 
-def predict_odme(release: Path, split: str, output: Path, lam: float = 0.05) -> None:
+def predict_odme(release: Path, split: str, output: Path, lam: float = 0.05,
+                 prior_power=0, prior_floor_ratio=0.1, selected=None, prior_only=False) -> None:
     parts = []
-    for name in panels(release, None):
+    for name in panels(release, selected):
         template, matrix, observed, base = odme_problem(release, name, split)
-        solution = solve_odme(matrix, observed, base, lam)
+        solution = base.copy() if prior_only else solve_odme(matrix, observed, base, lam, prior_power, prior_floor_ratio)
         template["path_flow"] = solution
         parts.append(template[ODME_COLUMNS])
+    if not parts:
+        raise ValueError(f"No ODME panels for {split}")
     result = pd.concat(parts, ignore_index=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output, index=False)
 
 
+def odme_structure(template, matrix):
+    columns = matrix.tocsc()
+    signatures = {}
+    for index in range(columns.shape[1]):
+        links = tuple(columns.indices[columns.indptr[index]:columns.indptr[index + 1]])
+        signatures[links] = signatures.get(links, 0) + 1
+    od_sizes = template.groupby(["origin_zone", "destination_zone"]).size()
+    return {"measured_links": matrix.shape[0], "paths": matrix.shape[1],
+            "unobserved_paths": int(np.sum(np.diff(columns.indptr) == 0)),
+            "distinct_measured_path_signatures": len(signatures),
+            "ambiguous_path_groups": sum(size > 1 for size in signatures.values()),
+            "paths_in_ambiguous_groups": sum(size for size in signatures.values() if size > 1),
+            "od_pairs": len(od_sizes), "od_pairs_with_multiple_paths": int((od_sizes > 1).sum()),
+            "max_paths_per_od": int(od_sizes.max()),
+            "destinations": int(template.destination_zone.nunique())}
+
+
+def odme_metrics(template, matrix, observed, base, estimate, fit):
+    loaded = np.asarray(matrix @ estimate).ravel()
+    metrics = {}
+    for label, mask in (("fit", fit), ("hidden", ~fit)):
+        residual = loaded[mask] - observed[mask]
+        normalized_l1 = float(np.sum(np.abs(residual)) / max(float(observed[mask].sum()), 1e-9))
+        rmse = float(np.sqrt(np.mean(residual ** 2)))
+        metrics.update({f"{label}_link_normalized_l1": normalized_l1,
+                        f"{label}_link_s_link": max(0.0, 1.0 - normalized_l1),
+                        f"{label}_link_rmse_vph": rmse,
+                        f"{label}_link_normalized_rmse": rmse / max(float(observed[mask].mean()), 1)})
+    movement = estimate - base
+    prior_total, estimate_total = float(base.sum()), float(estimate.sum())
+    destinations = template.destination_zone.to_numpy()
+    prior_attr = pd.Series(base).groupby(destinations).sum().to_numpy() / max(prior_total, 1e-9)
+    estimate_attr = pd.Series(estimate).groupby(destinations).sum().to_numpy() / max(estimate_total, 1e-9)
+    metrics.update({"prior_movement_l1": float(np.abs(movement).sum()),
+                    "prior_relative_l1": float(np.abs(movement).sum() / max(prior_total, 1e-9)),
+                    "prior_relative_l2": float(np.linalg.norm(movement) / max(np.linalg.norm(base), 1)),
+                    "destination_distribution_l1_from_prior": float(np.abs(estimate_attr - prior_attr).sum())
+                    if prior_total > 0 and estimate_total > 0 else None,
+                    "zero_path_fraction": float(np.mean(estimate == 0))})
+    return metrics
+
+
 def validate_odme(args):
     from learning import family_mean, stable_seed, write_json
-    rows = []
+    if args.repeats < 1 or not args.lambdas or not args.prior_powers:
+        raise ValueError("ODME validation needs candidates and at least one repeat")
+    if any(not np.isfinite(lam) or lam < 0 for lam in args.lambdas):
+        raise ValueError("ODME lambdas must be finite and nonnegative")
+    configurations = sorted({(float(lam), power) for lam in args.lambdas for power in args.prior_powers}
+                            | {(0.05, 0)})
+    candidates = [{"method": "prior", "lambda": None, "prior_power": None}]
+    candidates += [{"method": "nnls", "lambda": lam, "prior_power": power} for lam, power in configurations]
+    rows, structures = [], {}
     for name in panels(args.release_root, args.panel):
-        _, matrix, observed, base = odme_problem(args.release_root, name, args.split)
+        template, matrix, observed, base = odme_problem(args.release_root, name, args.split)
         if len(observed) < 2:
             raise ValueError("ODME link holdout needs at least two measured links")
-        rng = np.random.default_rng(stable_seed(args.seed, name, args.split))
-        hidden = rng.choice(len(observed), max(1, len(observed) // 5), replace=False)
-        fit = np.ones(len(observed), bool)
-        fit[hidden] = False
-        for lam in args.lambdas:
-            estimate = solve_odme(matrix[fit], observed[fit], base, lam)
-            rows.append({"panel": name, "lambda": lam,
-                         "hidden_link_rmse_vph": float(np.sqrt(np.mean((matrix[~fit] @ estimate - observed[~fit]) ** 2))),
-                         "hidden_link_normalized_rmse": float(np.sqrt(np.mean((matrix[~fit] @ estimate - observed[~fit]) ** 2)) / max(np.mean(observed[~fit]), 1)),
-                         "fit_link_rmse_vph": float(np.sqrt(np.mean((matrix[fit] @ estimate - observed[fit]) ** 2))),
-                         "prior_relative_l2": float(np.linalg.norm(estimate - base) / max(np.linalg.norm(base), 1)),
-                         "hidden_links": int((~fit).sum())})
-    scores = {lam: family_mean({row["panel"]: row["hidden_link_normalized_rmse"] for row in rows if row["lambda"] == lam}) for lam in args.lambdas}
-    report = {"split": args.split, "proxy_only": True, "lambda": min(scores, key=scores.get),
-              "normalized_hidden_link_rmse": scores, "panels": rows}
+        odme_prior_variance(base, 0, args.prior_floor_ratio)
+        structures[name] = odme_structure(template, matrix)
+        for repeat in range(args.repeats):
+            # The first mask stays comparable with earlier lambda-only reports.
+            seed = stable_seed(args.seed, name, args.split) if repeat == 0 else stable_seed(args.seed, name, args.split, repeat)
+            rng = np.random.default_rng(seed)
+            hidden = rng.choice(len(observed), max(1, len(observed) // 5), replace=False)
+            fit = np.ones(len(observed), bool)
+            fit[hidden] = False
+            for candidate in candidates:
+                estimate = base.copy() if candidate["method"] == "prior" else solve_odme(
+                    matrix[fit], observed[fit], base, candidate["lambda"], candidate["prior_power"], args.prior_floor_ratio)
+                rows.append({"panel": name, "repeat": repeat, **candidate,
+                             "hidden_link_indices": hidden.tolist(),
+                             **odme_metrics(template, matrix, observed, base, estimate, fit)})
+    if not rows:
+        raise ValueError("No ODME panels to validate")
+    summaries = []
+    for candidate in candidates:
+        matches = [row for row in rows if all(row[key] == value for key, value in candidate.items())]
+        summary = dict(candidate)
+        for metric in ("hidden_link_normalized_l1", "hidden_link_normalized_rmse", "hidden_link_s_link",
+                       "fit_link_normalized_l1", "prior_movement_l1", "prior_relative_l1", "prior_relative_l2",
+                       "destination_distribution_l1_from_prior", "zero_path_fraction"):
+            usable = [row for row in matches if row[metric] is not None]
+            panel_values = {}
+            for row in usable:
+                panel_values.setdefault(row["panel"], []).append(row[metric])
+            summary[metric] = family_mean({name: float(np.mean(values)) for name, values in panel_values.items()}) if usable else None
+        repeat_errors = [family_mean({row["panel"]: row["hidden_link_normalized_l1"] for row in matches
+                                     if row["repeat"] == repeat}) for repeat in range(args.repeats)]
+        summary["hidden_link_normalized_l1_std"] = float(np.std(repeat_errors))
+        summary["worst_panel_hidden_link_normalized_l1"] = max(
+            float(np.mean([row["hidden_link_normalized_l1"] for row in matches if row["panel"] == name]))
+            for name in structures)
+        summaries.append(summary)
+    best = min(summaries, key=lambda row: row["hidden_link_normalized_l1"])
+    report = {"split": args.split, "proxy_only": True, "selection_metric": "hidden_link_normalized_l1",
+              "seed": args.seed, "repeats": args.repeats, "prior_floor_ratio": args.prior_floor_ratio,
+              "best_proxy_candidate": {key: best[key] for key in ("method", "lambda", "prior_power")},
+              "candidates": summaries, "structure": structures, "panels": rows}
     write_json(args.output, report)
     print(report)
 
@@ -395,7 +513,7 @@ def make_submission(args: argparse.Namespace) -> None:
         else:
             official(sys.executable, official_root / "src" / "task2" / "build_task2_persistence_submission.py",
                      "--release-root", str(release), "--split", split, "--output", str(queue))
-        predict_odme(release, split, odme, args.odme_lambda)
+        predict_odme(release, split, odme, args.odme_lambda, args.odme_prior_power, args.odme_prior_floor_ratio)
         for task, path in zip(combined, (state, queue, odme)):
             combined[task].append(path)
     merged = {}
@@ -424,7 +542,7 @@ def make_submission(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("train-state", "train-queue", "submit", "evaluate", "validate-odme"):
+    for name in ("train-state", "train-queue", "submit", "evaluate", "validate-odme", "predict-odme"):
         command = commands.add_parser(name)
         command.add_argument("--release-root", type=Path, required=True)
         if name.startswith("train"):
@@ -489,7 +607,18 @@ def main() -> None:
             command.add_argument("--split", choices=["validation", "private"], default="validation")
             command.add_argument("--panel", action="append")
             command.add_argument("--lambdas", type=float, nargs="+", default=[0.01, 0.05, 0.2])
+            command.add_argument("--prior-powers", type=int, choices=[0, 1, 2], nargs="+", default=[0])
+            command.add_argument("--prior-floor-ratio", type=float, default=0.1)
+            command.add_argument("--repeats", type=int, default=3)
             command.add_argument("--seed", type=int, default=42)
+            command.add_argument("--output", type=Path, required=True)
+        elif name == "predict-odme":
+            command.add_argument("--split", choices=["validation", "private"], required=True)
+            command.add_argument("--panel", action="append")
+            command.add_argument("--odme-lambda", type=float, default=0.05)
+            command.add_argument("--prior-power", type=int, choices=[0, 1, 2], default=0)
+            command.add_argument("--prior-floor-ratio", type=float, default=0.1)
+            command.add_argument("--prior-only", action="store_true", help="Write the released prior without solving")
             command.add_argument("--output", type=Path, required=True)
         else:
             command.add_argument("--official-root", type=Path, required=True)
@@ -497,6 +626,8 @@ def main() -> None:
             command.add_argument("--state-checkpoint", type=Path, action="append")
             command.add_argument("--queue-checkpoint", type=Path, action="append")
             command.add_argument("--odme-lambda", type=float, default=0.05)
+            command.add_argument("--odme-prior-power", type=int, choices=[0, 1, 2], default=0)
+            command.add_argument("--odme-prior-floor-ratio", type=float, default=0.1)
     args = parser.parse_args()
     if args.command == "train-state":
         fit_state(args)
@@ -507,6 +638,9 @@ def main() -> None:
         evaluate(args)
     elif args.command == "validate-odme":
         validate_odme(args)
+    elif args.command == "predict-odme":
+        predict_odme(args.release_root, args.split, args.output, args.odme_lambda,
+                     args.prior_power, args.prior_floor_ratio, args.panel, args.prior_only)
     else:
         make_submission(args)
 
