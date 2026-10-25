@@ -111,7 +111,7 @@ L_13 = L_state
 
 Task 1의 양방향 복원 결과를 그대로 입력으로 넣지 않습니다. 초기 버전은 공개 `window_history.parquet`의 60분 기록만 사용하고 템플릿의 여섯 미래 시점을 동시에 예측합니다.
 
-**시간 경계는 파일로 확인합니다.** 현재 baseline 코드는 입력을 `[T-60분, T)`로 설명하며, 원본에서 `T`의 관측을 추가로 읽는 이전 동작을 누수로 지적합니다. 따라서 임의로 `T` 관측을 보충하지 않고 실제 입력 시각과 출력 시각 간 간격을 학습에도 그대로 재현합니다. [공식 Task 2 baseline](https://github.com/jacky850/trafficflowbench-public/blob/main/src/task2/build_task2_persistence_submission.py)
+**시간 경계는 파일로 확인합니다.** 2026-10-25 확인한 공식 명세는 `[T-60분, T)`의 기본 history 외에 공개된 `T` 행도 허용합니다. 기본 구현은 12시점이며, `--queue-origin`은 해당 split의 공개 masked 파일에서 `T`만 추가합니다. train에서도 같은 공개 마스킹을 사용하고, 없는 관측을 정답이나 미래 값으로 채우지 않습니다. [공식 Task 2 명세](https://github.com/jacky850/trafficflowbench-public/blob/main/docs/SCORING_SPEC.md#task-2-queue-forecasting), [공식 baseline](https://github.com/jacky850/trafficflowbench-public/blob/main/src/task2/build_task2_persistence_submission.py)
 
 ```text
 허용된 과거 관측 + 마스크 + 도로 특징

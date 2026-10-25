@@ -250,6 +250,15 @@ FEATURE_NAMES = ("speed", "flow_lane", "both_observed", "free_speed", "lanes", "
                  "off_ramp_flow", "on_ramp_valid", "off_ramp_valid", "prior_speed", "prior_flow_lane",
                  "prior_occupancy", "time_slot", "day_of_week", "relative_time")
 
+QUEUE_CHANGE_NAMES = ("speed_margin",) + tuple(
+    f"{channel}_{field}_{minutes}m" for minutes in (5, 15)
+    for channel in ("speed", "flow_lane", "occupancy") for field in ("delta", "valid")
+)
+
+
+def queue_feature_names(changes=False):
+    return FEATURE_NAMES + QUEUE_CHANGE_NAMES if changes else FEATURE_NAMES
+
 STATE_CONTEXT_NAMES = ("speed", "flow_lane", "lanes") + tuple(
     f"{channel}_{field}" for channel in ("speed", "flow")
     for field in ("left", "right", "left_age", "right_age", "left_valid", "right_valid", "observed")
@@ -312,6 +321,37 @@ def features_v2(day: StationDay, panel: PanelInfo, profile: np.ndarray,
     out[..., 29] = dow[:, None] / 6
     out[..., 30] = np.arange(steps)[:, None] / max(steps - 1, 1)
     return out
+
+
+def queue_features(day, panel, profile, ramp=None, origin=None, changes=False):
+    """Build Queue inputs from the supplied past and optional released origin only."""
+    x = features_v2(day, panel, profile, ramp)
+    if origin is None and not changes:
+        return x
+    times = pd.to_datetime(day.timestamps, utc=True, format="ISO8601")
+    if origin is not None:
+        if origin.shape != (1, len(panel.links), len(FEATURE_NAMES)):
+            raise ValueError("Unexpected released Queue origin shape")
+        x = np.concatenate((x, origin), axis=0)
+        times = times.append(pd.DatetimeIndex([times[-1] + pd.Timedelta(minutes=5)]))
+        elapsed = np.asarray((times - times[0]).total_seconds() / 300, dtype=np.float32)
+        for channel in range(3):
+            last = np.maximum.accumulate(np.where(x[..., 10 + channel] > 0, elapsed[:, None], -72), axis=0)
+            x[..., 14 + channel] = np.minimum(elapsed[:, None] - last, 72) / 72
+        x[..., 30] = np.arange(len(x))[:, None] / (len(x) - 1)
+    if not changes:
+        return x
+    extra = np.zeros((*x.shape[:2], len(QUEUE_CHANGE_NAMES)), np.float32)
+    extra[..., 0] = np.where(x[..., 10] > 0, x[..., 0] - panel.cutoffs[None] / 25, 0)
+    column = 1
+    for lag in (1, 3):
+        consecutive = np.asarray(times[lag:] - times[:-lag] == pd.Timedelta(minutes=5 * lag))
+        for channel, position in enumerate((0, 1, 9)):
+            good = (x[lag:, :, 10 + channel] > 0) & (x[:-lag, :, 10 + channel] > 0) & consecutive[:, None]
+            extra[lag:, :, column] = np.where(good, x[lag:, :, position] - x[:-lag, :, position], 0)
+            extra[lag:, :, column + 1] = good
+            column += 2
+    return np.concatenate((x, extra), axis=-1)
 
 
 def slice_day(day: StationDay, index: np.ndarray) -> StationDay:

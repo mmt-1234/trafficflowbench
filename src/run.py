@@ -492,18 +492,50 @@ def official(python: str, script: Path, *arguments: str) -> None:
     subprocess.run([python, str(script), *arguments], check=True)
 
 
+def external_state_inputs(release: Path, paths: list[Path]) -> dict[str, pd.DataFrame]:
+    parts = []
+    for path in paths:
+        frame = pd.read_csv(path, dtype={key: str for key in STATE_KEYS})
+        if set(STATE_COLUMNS) - set(frame):
+            raise ValueError(f"Missing Task 1 columns: {path}")
+        parts.append(frame[STATE_COLUMNS])
+    state = pd.concat(parts, ignore_index=True)
+    if state.empty or state[STATE_KEYS].isna().any().any() or state.duplicated(STATE_KEYS).any():
+        raise ValueError("Empty, incomplete, or duplicate external Task 1 keys")
+    for column in ("speed_kmh", "flow_vph"):
+        state[column] = pd.to_numeric(state[column], errors="coerce")
+    values = state[["speed_kmh", "flow_vph"]].to_numpy()
+    if not np.isfinite(values).all() or (values < 0).any():
+        raise ValueError("External Task 1 values must be finite and nonnegative")
+    result = {}
+    for split in ("validation", "private"):
+        templates = [pd.read_csv(release / "task1" / name / split / "sample_submission_state.csv",
+                                 usecols=STATE_KEYS, dtype=str) for name in panels(release, None)]
+        expected = pd.concat(templates, ignore_index=True)
+        aligned = expected.merge(state, on=STATE_KEYS, how="left", validate="one_to_one", sort=False)
+        if aligned[["speed_kmh", "flow_vph"]].isna().any().any():
+            raise ValueError(f"External Task 1 files do not cover every {split} template key")
+        result[split] = aligned[STATE_COLUMNS]
+    if sum(len(frame) for frame in result.values()) != len(state):
+        raise ValueError("External Task 1 files contain keys outside validation/private templates")
+    return result
+
+
 def make_submission(args: argparse.Namespace) -> None:
     official_root = args.official_root.resolve()
     release = args.release_root.resolve()
     for required in (official_root / "src" / "merge_submissions.py", release / "submission_key.csv"):
         if not required.exists():
             raise FileNotFoundError(required)
+    state_inputs = external_state_inputs(release, args.state_csv) if args.state_csv else None
     combined: dict[str, list[Path]] = {"state": [], "queue": [], "odme": []}
     for split in ("validation", "private"):
         folder = args.output_dir / split
         folder.mkdir(parents=True, exist_ok=True)
         state, queue, odme = (folder / f"{task}.csv" for task in combined)
-        if args.state_checkpoint:
+        if state_inputs is not None:
+            state_inputs[split].to_csv(state, index=False)
+        elif args.state_checkpoint:
             ensemble_predictions(release, split, args.state_checkpoint, state, "state")
         else:
             official(sys.executable, official_root / "src" / "task1" / "build_task1_baseline_submission.py",
@@ -595,6 +627,15 @@ def main() -> None:
             command.add_argument("--speed-weight", type=float, default=0.1)
             command.add_argument("--forward-only", dest="bidirectional", action="store_false")
             command.set_defaults(bidirectional=True)
+            command.set_defaults(queue_origin=False, queue_resample=False, queue_condition_gap=False,
+                                 queue_changes=False, queue_head="linear", queue_validation_spread=False)
+            if name == "train-queue":
+                command.add_argument("--queue-origin", action="store_true", help="Append the released masked observation at T")
+                command.add_argument("--queue-resample", action="store_true", help="Resample fit windows each epoch; keep evaluation fixed")
+                command.add_argument("--queue-condition-gap", action="store_true", help="Apply fit window spacing within each condition")
+                command.add_argument("--queue-changes", action="store_true", help="Add threshold margin and masked 5/15-minute changes")
+                command.add_argument("--queue-head", choices=["linear", "pooled-mlp"], default="linear")
+                command.add_argument("--queue-validation-spread", action="store_true", help="Spread fixed validation windows across dates")
         elif name == "evaluate":
             command.add_argument("--checkpoint", type=Path, required=True)
             command.add_argument("--period", choices=["select", "holdout"], default="select")
@@ -603,6 +644,9 @@ def main() -> None:
             command.add_argument("--max-days", type=int)
             command.add_argument("--workers", type=int, choices=[0, 1, 2], default=1)
             command.add_argument("--bootstrap", type=int, default=0)
+            command.add_argument("--validation-windows", type=int, help="Override the saved per-condition Queue validation limit")
+            command.add_argument("--queue-validation-spread", action="store_true", default=None,
+                                 help="Evaluate Queue on fixed windows spread across dates")
         elif name == "validate-odme":
             command.add_argument("--split", choices=["validation", "private"], default="validation")
             command.add_argument("--panel", action="append")
@@ -623,7 +667,10 @@ def main() -> None:
         else:
             command.add_argument("--official-root", type=Path, required=True)
             command.add_argument("--output-dir", type=Path, required=True)
-            command.add_argument("--state-checkpoint", type=Path, action="append")
+            state_source = command.add_mutually_exclusive_group()
+            state_source.add_argument("--state-checkpoint", type=Path, action="append")
+            state_source.add_argument("--state-csv", type=Path, action="append",
+                                      help="Task 1 CSVs covering all validation/private targets, including MagiNet outputs")
             command.add_argument("--queue-checkpoint", type=Path, action="append")
             command.add_argument("--odme-lambda", type=float, default=0.05)
             command.add_argument("--odme-prior-power", type=int, choices=[0, 1, 2], default=0)

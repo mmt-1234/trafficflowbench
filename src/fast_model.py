@@ -446,12 +446,21 @@ class TrafficStateModel(nn.Module):
 
 
 class TrafficQueueModel(nn.Module):
-    def __init__(self, station_decoder="linear", **config):
+    def __init__(self, station_decoder="linear", queue_head="linear", queue_changes=False, **config):
         super().__init__()
+        if queue_head not in ("linear", "pooled-mlp"):
+            raise ValueError("Unknown Queue head")
+        self.queue_head = queue_head
         self.encoder = TrafficEncoder(**config)
-        self.head = nn.Linear(config.get("width", 64), 12)
+        width = config.get("width", 64)
+        self.head = (nn.Linear(width, 12) if queue_head == "linear" else
+                     nn.Sequential(nn.Linear(2 * width, width), nn.GELU(),
+                                   nn.Dropout(config.get("dropout", 0.1)), nn.Linear(width, 12)))
 
     def forward(self, x, node_ids, segments, edges, bidirectional=True):
-        hidden = self.encoder(x, node_ids, segments, edges, bidirectional)[:, -1]
+        history = self.encoder(x, node_ids, segments, edges, bidirectional)
+        hidden = history[:, -1]
+        if self.queue_head == "pooled-mlp":
+            hidden = torch.cat((hidden, history.mean(1)), dim=-1)
         output = self.head(hidden).reshape(hidden.shape[0], hidden.shape[1], 6, 2).transpose(1, 2)
         return output[..., 0], F.softplus(output[..., 1])

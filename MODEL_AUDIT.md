@@ -309,3 +309,16 @@ cd /home/parkj/projects/trafficflowbench
   --release-root /home/parkj/projects/trafficflowbench/data/kaggle_public \
   --output /mnt/c/Users/parkj/project/trafficflowbench/artifacts/audit_20261002/gpu-eager.json
 ```
+
+## 2026-10-25: Task 2 입력·표본·출력층
+
+Queue 전용으로 공개 masked `T` 입력, epoch별 학습 창 재추출, 조건별 창 간격, 마지막·시간 평균 표현의 MLP 출력층, 5·15분 변화량을 선택 옵션으로 추가했습니다. 기본 31특징·12시점과 기존 체크포인트는 유지하며, 새 옵션은 각각 별도 경로에서 학습합니다. 검증에는 날짜를 분산한 고정 창과 `window_signature`를 추가했습니다. [실행 방법](README.md#task-2-입력표본출력층-비교)
+
+2026-10-25 확인한 [공식 Task 2 명세](https://github.com/jacky850/trafficflowbench-public/blob/main/docs/SCORING_SPEC.md#task-2-queue-forecasting)는 공개된 `T` 행 사용을 허용하고, 대상에서 `D12_I405_N/S`를 제외합니다. `T` 입력은 train에서도 공개 masked 파일에서만 읽으며, 해당 학습 원본이 바뀌면 재개를 차단합니다.
+
+- WSL 전체 회귀 검사 **60개 모두 통과**했습니다. 새 검사 7개에는 미래 관측·원래 정답의 입력 유입 차단, 결측·변화량 마스크, epoch별 재추출과 고정 검증, 날짜 분산, 기존 체크포인트 출력 일치, 학습 재개 및 State→Queue 전이, 추론 키·시간 경계를 포함했습니다. [검사 로그](reports/task2-tests-wsl.log)
+- RTX 5060 Ti에서 `D12_I5_S`의 fit·select 각각 첫 이틀로 기본형 1 epoch, 새 옵션 조합의 연속 2 epoch 및 1→2 epoch 재개를 BF16으로 실행했습니다. 두 후보의 검증 창은 동일한 6개였으며, 연속·재개 학습의 최대 가중치 차이는 `2.33e-10`이었습니다. 이는 실행·재현 검사입니다.
+- 새 조합의 입력은 `[10, 13, 100, 44]`였고, validation·private 각각 6,000행의 템플릿 키·순서·중복·0/1 값을 검사했습니다. 두 split에서 `T` 속도가 관측된 링크 비율은 합계 약 64.75%였습니다. 없는 `T` 속도는 결측으로 유지했습니다. [실제 데이터 검사](reports/task2-gpu-check.json)
+- Windows·WSL 소스에 반영했고, WSL의 별도 `MODEL_PLAN.md` 변경은 보존했습니다. 기존 `v2/queue.pt`, `queue-wavelet-only/queue.pt`, `v2/state.pt`의 SHA-256은 그대로입니다. 이전 소스는 WSL의 `artifacts/source-backup-20261025-task2-wno0orgf/`에 보관했습니다. [반영 기록](reports/task2-wsl-sync.json)
+
+전체 8개 패널의 재학습 성능·공식 Queue 점수·최종 병합 제출은 검증하지 않았습니다. 단독 옵션 비교에서 효과를 확인한 뒤 조합해 주세요. 현재 1월은 모델·임계값 선택에 함께 사용하며, 2월에는 저장된 임계값을 고정합니다.

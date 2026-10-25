@@ -147,7 +147,7 @@ IoU = 예측과 정답이 모두 정체인 링크-시각 수
       / 예측 또는 정답이 정체인 링크-시각 수
 ```
 
-정체가 새로 생기는 `queue_onset`과 이미 진행 중인 `queue_ongoing`을 나누어 평가합니다. 각 대상 패널·split마다 각각 5개 창이 있고, 모든 창의 미래에 실제 정체가 있습니다. [Task 2 명세](https://github.com/jacky850/trafficflowbench-public/blob/main/docs/SCORING_SPEC.md#task-2-queue-forecasting)
+정체가 새로 생기는 `queue_onset`과 이미 진행 중인 `queue_ongoing`을 나누어 평가합니다. 각 대상 패널·split마다 각각 5개 창이 있고, 모든 창의 미래에 실제 정체가 있습니다. Task 2는 `D12_I405_N/S`를 제외한 **8개 패널**이 대상입니다. 2026-10-25 확인한 공식 명세는 기본 history 외에 공개된 `T` 시점의 관측 사용도 허용합니다. [Task 2 명세](https://github.com/jacky850/trafficflowbench-public/blob/main/docs/SCORING_SPEC.md#task-2-queue-forecasting)
 
 ### Task 3: 물리적 일관성
 
@@ -466,6 +466,44 @@ env CHECKPOINT_DIR=artifacts/v2-signal-split \
 
 전처리는 위 비교 모두에 적용합니다. 실제 공개 2개 패널의 하루 24개 창에서 기존·새 특징과 문맥이 정확히 같았고, 20채널 전처리 중앙값은 81-station에서 **7.60→2.85ms**, 352-station에서 **31.53→9.32ms**였습니다. 같은 입력을 메모리에 둔 11회 교대 측정이며 기존 Queue 학습이 함께 실행 중이었습니다. 파일 읽기·전체 epoch 시간·점수 개선을 측정한 값은 아닙니다. [측정 결과](artifacts/signal-split-check/results.json), [재현 스크립트](artifacts/signal-split-check/verify.py), [검증 기록](MODEL_AUDIT.md#2026-10-05-진단-후-세-가지-수정)
 
+### Task 2: 입력·표본·출력층 비교
+
+2026-10-25에 Queue 전용 실험 옵션을 추가했습니다. 옵션을 생략하면 기존 31특징·12시점·선형 출력층과 표본 선택을 유지합니다. 기본 손실 `BCE + 0.2 × soft-IoU + 0.1 × 미래 속도 Smooth L1`은 바꾸지 않습니다. 아래 구조의 점수 개선은 전체 학습 비교로 확인해야 합니다.
+
+| 옵션 | 변경 내용 |
+| --- | --- |
+| `--queue-origin` | 공개 `mainline_states_masked`의 `T` 행을 추가해 13시점으로 입력합니다. train에서도 masked 원본을 사용하며, 가려진 채널·없는 링크·없는 시각은 결측으로 유지합니다. `T` 이후 값으로 보간하지 않습니다. |
+| `--queue-resample` | 학습 창을 epoch별 seed로 재추출합니다. 검증 창은 epoch와 무관하게 고정합니다. |
+| `--queue-condition-gap` | 학습 창의 기본 360분 간격을 onset·ongoing·normal 각각에 적용합니다. |
+| `--queue-head pooled-mlp` | 마지막 시점과 시간 평균 표현을 연결해 `128 → 64 → 12` MLP로 미래 여섯 시점을 동시에 예측합니다. 차원은 기본 폭 64 기준입니다. |
+| `--queue-changes` | `속도 - v_cut`과 속도·차로당 교통량·점유율의 5·15분 변화량 및 유효 마스크를 추가합니다. 총 44특징이며, 변화량은 입력 창 내 양 끝 관측과 정확한 시간 간격이 있을 때만 계산합니다. |
+| `--queue-validation-spread --validation-windows 20` | 조건별로 날짜를 고르게 방문하고 하루 최대 한 창씩, 패널·조건별 최대 20개를 평가합니다. 검증의 360분 간격은 조건별로 적용합니다. 조건이 부족하면 실제 창 수가 더 적습니다. |
+
+먼저 같은 seed·날짜·검증 설정·epoch 예산에서 기본형과 각 옵션을 하나씩 비교합니다. 아래 명령은 WSL 프로젝트 루트에서 실행하는 MLP 단독 비교 예시입니다. 입력·표본 옵션은 생략하고, 다른 후보에도 같은 `--queue-validation-spread --validation-windows 20`을 전달합니다.
+
+```bash
+cd /home/parkj/projects/trafficflowbench
+.venv/bin/python -u src/run.py train-queue \
+  --release-root data/kaggle_public --checkpoint artifacts/task2/pooled/queue.pt \
+  --epochs 75 --seed 42 --precision bf16 \
+  --queue-validation-spread --validation-windows 20 --queue-head pooled-mlp
+```
+
+`--queue-head pooled-mlp`를 생략한 기본형을 별도 폴더에 저장하고, `--queue-origin`, `--queue-resample`, `--queue-condition-gap`, `--queue-changes`도 각각 별도 폴더에서 비교합니다. 초기 실행 검사에는 `--panel D12_I5_S --max-days 3 --epochs 2`를 사용합니다. 전체 기간의 비교와 실행 검사를 구분합니다.
+
+기존 모델도 저장된 입력·출력층·판정 임계값을 유지하면서 더 많은 고정 창에서 재평가할 수 있습니다.
+
+```bash
+.venv/bin/python src/run.py evaluate --release-root data/kaggle_public \
+  --checkpoint artifacts/v2/queue.pt --period select \
+  --queue-validation-spread --validation-windows 20 \
+  --output reports/task2-baseline-spread.json
+```
+
+보고서의 `window_signature`가 같아야 동일 창 비교입니다. `proxy_IoU`, `onset`, `ongoing`, `normal_false_positive`, 패널별 결과를 함께 확인합니다. 학습 로그의 `fit_windows`와 `optimizer_updates`로 표본 수·업데이트 비용도 확인합니다. 현재는 1월에서 모델과 판정 임계값을 선택하고, 2월 평가에는 저장된 임계값을 고정합니다. 공식 정체 정답이 없는 상태의 대리 검증입니다.
+
+새 옵션은 체크포인트에 저장되며 재개·평가·제출 추론에도 같은 설정을 사용합니다. 기존 체크포인트를 `--resume`하면서 입력·표본·출력층 옵션을 새로 켜면 오류로 안내합니다. 새 후보는 새 저장 경로에서 학습해 주세요. `--init-state`는 FAST v2 State 인코더 전용이며, 변화량 특징을 추가하면 새 입력 열의 전이 가중치를 0으로 시작합니다. `T` 입력을 쓴 모델은 재개 시 해당 학습용 masked 파일의 변경도 검사합니다.
+
 ### 선택 구간과 2월 잠금 평가
 
 학습은 2030년 6~12월, 선택은 2031년 1월입니다. State는 배포된 `mainline_states_masked`와 Task 1 train 템플릿의 **정확한 대상 셀**을 사용합니다. 선택 지표는 RMSE 기반 State를 regime·방향·도로군으로 집계합니다. Queue는 공개 관측으로 만든 대리 라벨에서 onset·ongoing을 패널·도로군별로 집계하며, 정상 유지 창의 오탐과 미래 속도 RMSE도 기록합니다.
@@ -536,3 +574,224 @@ Task 4 예측만 저장하려면 아래 명령을 사용합니다. `--prior-powe
 ```
 
 이전 9채널 체크포인트의 1월 재평가 값은 State 정규화 MSE 0.009547, Queue 대리 IoU 0.4548입니다. 새 v2와 다른 마스크·라벨·집계 조건이므로 직접 성능 비교하지 않습니다. 전체 v2 학습·여러 seed 성능 비교·Kaggle 점수 재현은 아직 수행하지 않았습니다. [검증 기록](MODEL_AUDIT.md)
+
+## 12. MagiNet을 로컬에서 실행하기
+
+`src/maginet.py`는 `notebooks/task13_maginet_colab.ipynb`의 AMSTenc·MASTdec·양방향 GRU·보간 잔차 출력과 State·N·ΔN 손실을 옮긴 로컬 실행본입니다. 노트북은 Colab 실험 기록으로 유지합니다. 로컬에서는 Drive 마운트·Jupyter·IPython·Matplotlib·Mamba 패키지 없이 기존 `requirements-model.txt`의 패키지를 사용합니다. 그래프 이미지 대신 점수·학습 기록을 CSV로 저장합니다.
+
+기본 실험은 노트북 설정과 같은 `temporal_direct`입니다. 기존 `baseline`, `dn_003`, `dn_zero`, `mask_resample`, `learned_graph`와 아래의 시간 경로를 유지하는 분리 실험을 `--experiment`로 선택합니다. 새 설정의 성능 개선은 별도 학습·평가로 확인해야 합니다.
+
+| 경로·옵션 | 동작 |
+| --- | --- |
+| `data/release_root.txt` | 기존 로컬 데이터 경로를 읽습니다. `--release-root`로 직접 지정할 수도 있습니다. |
+| `data/maginet_cache/` | 날짜별 NPZ, fit 과거 평균과 정규화 통계를 계속 보관합니다. `--cache-dir`로 변경합니다. |
+| `reports/maginet/<실험명>/` | 기본 결과 폴더입니다. `--output-dir`로 별도 실행 폴더를 지정합니다. |
+| `--cache-mode build` | 기본값입니다. 없거나 원본이 바뀐 캐시를 생성·갱신하고, 검증된 캐시는 재사용합니다. |
+| `--cache-mode reuse` | 필요한 캐시가 없거나 원본 변경·출처 기록 누락을 발견하면 중단합니다. |
+| `--device auto --precision auto` | CUDA가 있으면 지원되는 BF16 또는 FP16을 사용합니다. CPU에서는 FP32로 실행합니다. |
+
+점검용·전체 학습용 캐시는 fit 날짜·과거 평균·도로 정보에 따른 별도 경로로 저장합니다. 모델 실험만 바뀌고 입력이 같으면 같은 캐시를 사용합니다. 데이터·캐시·결과는 기존 Git 제외 경로 안에 있습니다.
+
+프로필과 일별 NPZ 옆의 `.sources.json`에 실제 입력 파일의 내용 SHA-256을 기록합니다. fit 원본·도로 CSV, 날짜별 원본·masked·램프 파일과 템플릿 대상이 검증에 포함됩니다. 파일 수정 시각이 같아도 내용 변경을 감지하며, 절대 경로를 제외하므로 같은 데이터를 다른 위치로 옮겨도 검증할 수 있습니다.
+
+이전 캐시는 출처 기록이 없으므로 `prepare --cache-mode build`로 원본과 한 번 대조해야 합니다. 계산된 배열이 같으면 기존 NPZ를 다시 쓰지 않고 출처 기록만 추가해 기존 재개 서명을 유지합니다. 변경된 입력은 필요한 캐시를 갱신하며, 학습 입력이 달라진 기존 실행의 재개는 거부합니다. 이후에도 입력 내용을 해시로 확인하는 읽기 비용은 발생합니다.
+
+### 작은 실행 점검과 전체 학습
+
+다음은 Windows PowerShell에서 프로젝트 루트를 기준으로 실행하는 명령입니다. 첫 명령은 한 패널에서 fit·early·blend의 regime별 하루, 2 epoch, regime별 업데이트 1회로 전체 흐름을 확인합니다. 기본 5 epoch의 물리 손실 준비 기간을 유지하므로 이 점검 학습은 State만 사용합니다. 전체 데이터 성능을 판단하는 실행이 아닙니다.
+
+```powershell
+.venv\Scripts\python.exe -u src\maginet.py smoke --panel D12_I405_S --precision bf16
+.venv\Scripts\python.exe -u src\maginet.py prepare --experiment temporal_direct
+.venv\Scripts\python.exe -u src\maginet.py train --experiment temporal_direct --epochs 50
+```
+
+`prepare`는 입력 준비만 수행합니다. `train`도 필요한 입력을 준비하므로 캐시가 이미 있으면 바로 `train`을 실행해도 됩니다. `--panel`을 생략하면 10개 패널을 공동 학습합니다. `--days-per-regime N`으로 기간·regime별 날짜를 줄일 수 있으며, fit 과거 평균도 제한한 fit 날짜로만 계산합니다.
+
+기본 배치는 2, 폭 64, 블록 3개, 최대 50 epoch입니다. `--batch-size`, `--width`, `--blocks`, `--heads`, `--updates-per-group`, `--lr`, `--patience`로 조정합니다. epoch별 로그를 출력하며 `full/best_maginet.pt`, `full/last_maginet.pt`, `full/history.csv`를 저장합니다. 기존 체크포인트가 있으면 새 학습으로 덮어쓰지 않습니다.
+
+```powershell
+.venv\Scripts\python.exe -u src\maginet.py train --experiment temporal_direct --resume --epochs 75
+```
+
+`--epochs`는 재개 이전을 포함한 총 epoch 수입니다. 설정·입력 캐시 내용·도로 정보가 같아야 재개하며 optimizer·scheduler·난수 상태도 복원합니다. 데이터·캐시·실행 폴더의 절대 경로는 서명에서 제외하므로 동일 내용을 다른 위치로 옮길 수 있습니다. 장치·PyTorch·정밀도·CPU 스레드 수가 바뀌면 수치적으로 같은 학습을 보장하지 않습니다. 이 실행 환경 정보도 체크포인트에 기록합니다.
+
+### 시간 경로를 유지하는 분리 실험과 패널별 배치
+
+2026-10-23에 WSL의 기존 10개 패널·50 epoch 실행을 확인했습니다. 1월 후반 State는 시간 보간 0.906766, `temporal_direct` 0.926482였으며 30개 패널×regime 모두 개선됐습니다. 공식 비공개 점수가 아닌 로컬 선택 구간 결과입니다. 이후 비교는 학습 기간 연장보다 아래 손실·구조를 각각 바꾸는 실험으로 진행합니다.
+
+| 실험 | 시간 경로 | N 가중치 | ΔN 가중치 | 학습형 공간 경로 |
+| --- | --- | ---: | ---: | --- |
+| `temporal_direct` | 유지 | 0.05 | 0.10 | 없음 |
+| `temporal_direct_dn003` | 유지 | 0.05 | 0.03 | 없음 |
+| `temporal_direct_dnzero` | 유지 | 0.05 | 0 | 없음 |
+| `temporal_direct_learned_graph` | 유지 | 0.05 | 0.10 | 추가 |
+| `temporal_direct_dn003_learned_graph` | 유지 | 0.05 | 0.03 | 추가 |
+
+기존 `dn_003`, `dn_zero`, `learned_graph`는 시간 경로가 꺼진 설정입니다. `temporal_direct_dn003_learned_graph`는 `temporal_direct_dn003`에서 학습형 공간 경로만 추가합니다. 나머지 위 분리 실험은 `temporal_direct`에서 한 요소만 바꾸며, fit 과거 평균·정규화·캐시·평가 기간을 공유합니다. `temporal_direct_dnzero`도 N 손실은 유지합니다.
+
+다음은 WSL 프로젝트 루트에서 실행하는 전체 데이터 비교 명령입니다. 원래 실행과 같은 배치 2·최대 50 epoch를 사용하고 각 실험의 새 기본 결과 폴더에 저장합니다. 기존 50 epoch 실행에 `--resume`으로 설정을 바꾸지 않습니다.
+
+```bash
+.venv/bin/python -u src/maginet.py train --release-root data/kaggle_public --experiment temporal_direct_dn003 --cache-mode reuse --epochs 50 --precision bf16
+.venv/bin/python -u src/maginet.py train --release-root data/kaggle_public --experiment temporal_direct_dnzero --cache-mode reuse --epochs 50 --precision bf16
+.venv/bin/python -u src/maginet.py train --release-root data/kaggle_public --experiment temporal_direct_learned_graph --cache-mode reuse --epochs 50 --precision bf16
+```
+
+처리량 비교는 별도 실행에서 `--batch-policy adaptive`로 선택합니다. 관측소가 128개 이하이면 배치 8, 초과하면 4를 사용합니다. `--panel-batch PANEL=SIZE`를 반복해서 패널별로 재지정할 수 있으며 policy보다 우선합니다. 기본은 이전과 같은 `fixed`·배치 2입니다. `--batch-size`는 `fixed`에서 사용합니다.
+
+```bash
+.venv/bin/python -u src/maginet.py train --release-root data/kaggle_public --experiment temporal_direct --batch-policy adaptive --panel-batch D7_I405_N=4 --cache-mode reuse --epochs 50 --precision bf16 --output-dir reports/maginet/temporal_direct_adaptive
+```
+
+패널별 배치는 config·체크포인트에 저장하고 재개·평가·추론에도 적용합니다. 같은 실행을 재개할 때 옵션을 다시 입력하지 않아도 되며, 배치 설정이 달라지면 재개를 거부합니다. 이전 로컬 체크포인트에는 기본 `fixed` 설정을 적용합니다. 평가·추론 명령에서 `--batch-policy`·`--panel-batch`를 다시 지정하지 않습니다. `evaluate`·`predict --batch-size N`은 해당 실행에서 모든 패널의 배치를 N으로 덮어쓰며 체크포인트를 변경하지 않습니다. `--width`, `--lr`, `--input-normalization` 등 학습 설정은 평가·추론에서 지정하면 오류로 안내합니다.
+
+`history.csv`에는 `optimizer_updates`와 `train_windows`를 추가로 기록합니다. adaptive도 패널×regime당 update 수는 같아서 한 epoch의 학습 창 수가 늘어납니다. 손실·그래프 효과의 분리 비교에는 같은 fixed 배치를 사용하고, adaptive의 속도·성능은 창 수·update 수·시간을 함께 비교해 주세요. 위 배치 크기는 처리량 측정에서 정한 시작값이며 전체 학습의 성능 향상을 보장하지 않습니다.
+
+### 평가와 Task 1·3 예측
+
+학습은 6~12월, 체크포인트 선택은 1월 전반, 보간 혼합 비율 선택은 1월 후반을 사용합니다. 학습 완료 후 공통 `alpha`를 자동 선택해 `selected_alpha.json`에 저장합니다. 기존 실험의 기본 선택 기준은 노트북의 `0.70 State + 0.10 FD_proxy + 0.20 LWR_proxy`이며 공식 Physics 점수가 아닙니다. 아래 새 문맥·채널 공간 실험은 기본으로 State를 사용합니다. 체크포인트·scheduler·조기 종료·공통 `alpha`에 같은 선택 기준을 적용하고 Physics 대리 점수도 계속 기록합니다.
+
+```powershell
+.venv\Scripts\python.exe -u src\maginet.py evaluate --checkpoint reports\maginet\temporal_direct\full\best_maginet.pt --period blend --select-alpha
+.venv\Scripts\python.exe -u src\maginet.py evaluate --checkpoint reports\maginet\temporal_direct\full\best_maginet.pt --period february
+.venv\Scripts\python.exe -u src\maginet.py predict --checkpoint reports\maginet\temporal_direct\full\best_maginet.pt --split both
+```
+
+2월은 저장된 `alpha`를 고정한 추가 진단입니다. 이전 실험에서 사용한 달이므로 독립적인 최종 평가라고 부르지 않습니다. `--alpha`를 명시하면 해당 비율과 보간을 비교할 수 있습니다. 저장된 선택값은 체크포인트 내용·평가 패널과 대조하며, 체크포인트가 바뀌면 1월 후반에서 다시 선택합니다.
+
+체크포인트에는 입력 정규화 통계·관측소 순서·도로 정보·fit 과거 평균을 함께 저장합니다. `predict`에는 공개 validation/private 입력과 템플릿만 필요하며 학습용 원본·fit NPZ를 다시 읽지 않습니다. 패널별 CSV는 `submissions/task1-<패널>-<split>.csv`에 저장하고 관측소 총 교통량으로 환산합니다. 이 파일이 Task 3 입력도 됩니다. 기본 출력 폴더는 지정한 체크포인트의 실행 폴더이며 `--output-dir`로 변경할 수 있습니다.
+
+체크포인트가 `full/` 안에 있으면 그 위 실행 폴더에서 `selected_alpha.json`을 찾고, 다른 위치의 체크포인트는 같은 폴더에서 찾습니다. 따라서 `portable/best.pt`에 대해 `evaluate --select-alpha`로 만든 혼합 선택 파일을 그대로 `predict`에서 사용할 수 있습니다. 선택 파일을 별도 출력 폴더에 저장했다면 `--selection`으로 지정합니다.
+
+### 과거 구간 검색을 추가하는 WSL 실행
+
+기존 신경망을 고정하고 fit 기간의 과거 패턴을 보조 예측으로 섞을 수 있습니다. 신경망 재학습·`--resume`은 필요하지 않습니다. 이 옵션에는 체크포인트와 같은 fit NPZ·학습 원본이 추가로 필요합니다. 기존 입력 캐시를 읽어 메모리에 검색 자료를 구성하며 별도 검색 캐시 파일은 만들지 않습니다.
+
+`--select-retrieval`은 1월 전반에서 하루 전체 검색, 3시간 구간 검색, 신뢰도를 반영한 구간 검색을 비교하고 State 기준으로 방법 하나와 속도·교통량별 혼합 비율 두 개를 선택합니다. 구간 검색은 90분 간격으로 겹치며 과거 패턴을 ±10분 정렬합니다. 같은 과거 날짜가 여러 검색 이웃 자리를 차지하지 않게 하고, 관측과 잘 맞지 않거나 후보 간 차이가 크면 신뢰도를 낮춥니다. 검색 거리·신뢰도에는 공개된 관측만 사용합니다.
+
+다음 명령은 WSL의 `/home/parkj/projects/trafficflowbench`에서 실행합니다. 입력 캐시가 준비된 기존 `temporal_direct_dn003` 체크포인트를 사용하며 선택 결과는 `reports/maginet/temporal_direct_dn003/retrieval/selected_retrieval.json`에 저장합니다. 두 번째 명령은 비율을 고정해 1월 후반을 평가합니다.
+
+```bash
+cd /home/parkj/projects/trafficflowbench
+.venv/bin/python -u src/maginet.py evaluate --release-root data/kaggle_public --checkpoint reports/maginet/temporal_direct_dn003/full/best_maginet.pt --cache-mode reuse --precision bf16 --period early --select-retrieval
+.venv/bin/python -u src/maginet.py evaluate --release-root data/kaggle_public --checkpoint reports/maginet/temporal_direct_dn003/full/best_maginet.pt --cache-mode reuse --precision bf16 --period blend --retrieval-selection reports/maginet/temporal_direct_dn003/retrieval/selected_retrieval.json
+```
+
+선택 구간의 방법별 점수는 `retrieval_early_comparison.csv`, 후반 점수는 `blend_macro.csv`, 패널별 점수는 `blend_panel_regime.csv`에 저장합니다. `alpha_0.0`은 시간 보간, `alpha_1.0`은 검색을 섞은 신경망 결과입니다. 검색 옵션을 지정하면 기본 출력은 기존 실행 폴더 아래 `retrieval/`이며 원래 평가 파일과 선택한 `alpha`를 덮어쓰지 않습니다. 검색은 신경망 예측에 혼합하도록 선택하므로 기존 보간 `alpha` 선택과 함께 지정하지 않습니다.
+
+validation/private 예측 명령입니다. 선택 파일과 체크포인트·fit 자료의 해시를 대조한 후 고정된 방법과 비율만 적용합니다. 출력은 `retrieval/submissions/task1-<패널>-<split>.csv`이며 Task 3 입력으로도 사용할 수 있습니다. 1월 전반·후반과 2월은 반복 사용한 개발 구간이므로 공식 점수나 새로운 독립 시험으로 해석하지 않습니다.
+
+```bash
+.venv/bin/python -u src/maginet.py predict --release-root data/kaggle_public --checkpoint reports/maginet/temporal_direct_dn003/full/best_maginet.pt --cache-mode reuse --precision bf16 --retrieval-selection reports/maginet/temporal_direct_dn003/retrieval/selected_retrieval.json --split both
+```
+
+다음은 `dN=0.03`을 유지하고 학습형 공간 경로만 추가하는 별도 학습입니다. 새 기본 폴더 `reports/maginet/temporal_direct_dn003_learned_graph/`에 처음부터 학습하며 기존 `.03` 실행에 `--resume`으로 구조를 끼워 넣지 않습니다. 새 조합의 전체 데이터 성능은 별도 학습으로 확인해야 합니다.
+
+```bash
+.venv/bin/python -u src/maginet.py train --release-root data/kaggle_public --experiment temporal_direct_dn003_learned_graph --cache-mode reuse --epochs 50 --precision bf16
+```
+
+학습 완료 후에는 다음 두 명령으로 새 모델의 검색 비율을 선택하고 평가합니다. WSL 프로젝트 루트에서 실행하며 셸 변수 없이 각각 실행할 수 있습니다. 새 모델이므로 기존 `.03` 모델의 검색 선택 파일을 재사용하지 않습니다. `/full/best_maginet.pt`처럼 모델 이름이 사라진 경로가 오류에 나오면 비어 있는 셸 변수가 명령에 들어갔는지 확인해 주세요.
+
+```bash
+.venv/bin/python -u src/maginet.py evaluate --release-root data/kaggle_public --checkpoint reports/maginet/temporal_direct_dn003_learned_graph/full/best_maginet.pt --cache-mode reuse --precision bf16 --period early --select-retrieval
+.venv/bin/python -u src/maginet.py evaluate --release-root data/kaggle_public --checkpoint reports/maginet/temporal_direct_dn003_learned_graph/full/best_maginet.pt --cache-mode reuse --precision bf16 --period blend --retrieval-selection reports/maginet/temporal_direct_dn003_learned_graph/retrieval/selected_retrieval.json
+```
+
+### 관측 문맥과 채널별 공간 보정
+
+2026-10-24 문헌 검토의 첫 개발 단계인 관측 신뢰도 결합과 채널별 공간 잔차를 구현했습니다. 기존 fit 입력·캐시·손실 계수 `N=0.05`, `dN=0.03`을 사용하며 새 외부 패키지는 필요하지 않습니다. 두 실험은 처음부터 학습하는 별도 후보입니다. 기존 실행을 `--resume`해서 구조를 바꾸지 않습니다.
+
+| 실험 | 추가 공간 경로 | 기본 선택 기준 |
+| --- | --- | --- |
+| `temporal_direct_dn003_context_graph` | 기존 블록의 스칼라 게이트에 관측소·시각별 문맥 게이트를 추가합니다. | State |
+| `temporal_direct_dn003_channel_graph` | 블록의 추가 학습형 그래프를 출력 쪽으로 옮겨 속도·교통량별 공간 잔차와 게이트를 둡니다. | State |
+
+게이트에는 공개된 속도·교통량·occupancy 관측 여부, 같은 시각에 속도·교통량이 모두 관측된 물리 이웃 수·비율, 물리 이웃 존재 여부, 좌우 관측까지의 시간 간격을 사용합니다. 이웃 집계는 자신을 제외합니다. 마스크를 반영한 기존 공간 Attention과 집계를 재사용하며, 관측소 전체가 비어 있는 시각에는 채널 공간 경로가 bias만으로 보정하지 않습니다. 채널별 공간 보정은 0에서 시작하고 학습으로 켜집니다. 공유 backbone도 함께 학습하므로 기존 교통량 출력의 보존을 보장하는 구성은 아닙니다.
+
+다음 명령은 WSL의 `/home/parkj/projects/trafficflowbench`에서 실행합니다. 권장 첫 후보는 `channel_graph`입니다. 전체 50 epoch 학습과 목표 0.95 달성 여부는 별도 실측이 필요합니다.
+
+```bash
+cd /home/parkj/projects/trafficflowbench
+.venv/bin/python -u src/maginet.py train \
+  --release-root data/kaggle_public \
+  --experiment temporal_direct_dn003_channel_graph \
+  --cache-mode reuse --epochs 50 --precision bf16
+```
+
+결과는 `reports/maginet/temporal_direct_dn003_channel_graph/`에 저장합니다. `full/best_maginet.pt`와 `full/best_state_maginet.pt`는 1월 전반 State가 가장 높은 같은 모델입니다. `full/last_maginet.pt`는 optimizer·scheduler·난수 상태를 포함한 재개용이며, `history.csv`에는 State·Physics 복합 대리 점수·실제 선택 점수 `early_checkpoint_score`를 함께 기록합니다. 자동 보간 선택은 별도 `selected_alpha.json`에 저장합니다.
+
+학습 후 새 모델로 검색 비율을 선택하고, 고정한 비율로 평가합니다. 셸 변수 없이 각각 실행할 수 있습니다. 기존 모델의 검색 선택 파일은 새 체크포인트와 맞지 않으므로 새로 선택합니다.
+
+```bash
+.venv/bin/python -u src/maginet.py evaluate \
+  --release-root data/kaggle_public \
+  --checkpoint reports/maginet/temporal_direct_dn003_channel_graph/full/best_maginet.pt \
+  --cache-mode reuse --precision bf16 --period early --select-retrieval
+.venv/bin/python -u src/maginet.py evaluate \
+  --release-root data/kaggle_public \
+  --checkpoint reports/maginet/temporal_direct_dn003_channel_graph/full/best_maginet.pt \
+  --cache-mode reuse --precision bf16 --period blend \
+  --retrieval-selection reports/maginet/temporal_direct_dn003_channel_graph/retrieval/selected_retrieval.json
+.venv/bin/python -u src/maginet.py predict \
+  --release-root data/kaggle_public \
+  --checkpoint reports/maginet/temporal_direct_dn003_channel_graph/full/best_maginet.pt \
+  --cache-mode reuse --precision bf16 --split both \
+  --retrieval-selection reports/maginet/temporal_direct_dn003_channel_graph/retrieval/selected_retrieval.json
+```
+
+검색을 적용한 평가는 `retrieval/blend_macro.csv`, 제출 CSV는 `retrieval/submissions/`에 저장합니다. 검색 없는 모델 단독 비교는 검색 옵션 없이 `evaluate --period blend --alpha 1`로 실행합니다. 기존 `.03`·이전 graph와 구조 자체를 비교할 때에는 같은 State 선택·학습량의 별도 실행도 준비해 주세요.
+
+```bash
+.venv/bin/python -u src/maginet.py train \
+  --release-root data/kaggle_public --experiment temporal_direct_dn003_context_graph \
+  --cache-mode reuse --epochs 50 --precision bf16
+.venv/bin/python -u src/maginet.py train \
+  --release-root data/kaggle_public --experiment temporal_direct_dn003 \
+  --checkpoint-metric state --output-dir reports/maginet/temporal_direct_dn003_state \
+  --cache-mode reuse --epochs 50 --precision bf16
+```
+
+`--checkpoint-metric state|proxy`로 새 학습의 선택 기준을 지정할 수 있습니다. 재개·평가·추론은 저장한 구조와 선택 기준을 복원합니다. 재개 시 기준을 바꾸면 설정 불일치로 중단합니다. 새 동일 실행을 총 75 epoch까지 이어갈 경우에만 다음 명령을 사용합니다.
+
+```bash
+.venv/bin/python -u src/maginet.py train \
+  --release-root data/kaggle_public --experiment temporal_direct_dn003_channel_graph \
+  --cache-mode reuse --precision bf16 --resume --epochs 75
+```
+
+이번 단계에는 방향·시간차 메시지, hypergraph, 주파수 분해를 포함하지 않았습니다. 문맥·채널별 결합의 실익을 확인한 뒤 별도 구조 실험으로 비교합니다. 이전 모델도 계속 저장한 설정으로 평가·추론할 수 있습니다.
+
+### Colab 캐시·체크포인트 가져오기
+
+Colab에서 내려받은 `full/config.json`, `best_maginet.pt`, 선택적인 `last_maginet.pt`와 fit 과거 평균을 별도 폴더에 보관합니다. 기존 NPZ ZIP이 있다면 다음처럼 가져올 수 있습니다. 경로는 실제 로컬 파일로 바꿔 주세요.
+
+```powershell
+.venv\Scripts\python.exe -u src\maginet.py import-colab --source-run C:\models\maginet-colab --cache-zip C:\models\preprocessed.zip --output-dir reports\maginet\imported
+```
+
+ZIP 없이 이미 푼 `<패널>/fit|early|blend/YYYY-MM-DD.npz` 폴더를 `--cache-dir`로 지정할 수도 있습니다. 과거 평균이 다른 위치에 있으면 `--legacy-profile-dir`로 이전 `full/` 폴더를 지정합니다. 출처 기록이 없는 이전 NPZ·과거 평균은 기본 `build` 모드에서 실제 원본과 한 번 대조합니다. NPZ가 없으면 같은 fit 기간으로 로컬 입력을 생성합니다. `mask_resample`은 노트북과 마찬가지로 대상 occupancy 원본이 없는 캐시로 학습할 수 없습니다.
+
+가져오기는 원래 설정과 체크포인트 서명, 관측소·기간·fit 과거 평균·입력 정규화가 맞는지 확인하고 별도 로컬 체크포인트를 만듭니다. 원본 Colab 파일은 수정하지 않습니다. `last_maginet.pt`까지 가져온 경우 같은 `--output-dir`에서 `train --resume`으로 재개할 수 있습니다. 기존 보간 선택값은 새 로컬 체크포인트에 그대로 연결하지 않으므로 `evaluate --period blend --select-alpha`를 실행해 다시 선택합니다.
+
+### 다른 과제와 최종 병합
+
+`src/run.py submit --state-csv`는 MagiNet CSV를 받아 기존 Queue·ODME와 공식 병합기로 연결합니다. 10개 패널의 validation/private 예측이 모두 있어야 하며 누락·중복·음수·비유한 값·템플릿 밖 키는 거부합니다. `--state-checkpoint`와 함께 지정하지 않습니다.
+
+```powershell
+$release = (Get-Content data\release_root.txt -Raw).Trim()
+$stateFiles = Get-ChildItem reports\maginet\temporal_direct\submissions\task1-*.csv |
+  ForEach-Object { @('--state-csv', $_.FullName) }
+.venv\Scripts\python.exe src\run.py submit --official-root C:\path\trafficflowbench-public --release-root $release --output-dir reports\maginet\submission @stateFiles
+```
+
+`--official-root`는 별도로 준비한 주최 측 저장소입니다. Queue 체크포인트를 지정하지 않으면 공식 persistence를 사용하고 Task 4는 기존 NNLS 설정을 사용합니다. 단일 패널 점검 모델의 CSV는 전체 제출로 사용할 수 없습니다.
+
+2026-10-22에 Windows RTX 5060 Ti에서 `D12_I405_S`의 regime별 하루로 BF16 학습을 시작하고 6 epoch까지 재개해 N·ΔN 보조 손실이 켜지는 것을 확인했습니다. validation 93,718행·private 107,416행 CSV의 템플릿 키·중복·값도 검사했습니다. 이는 한 패널의 작은 실행 점검이며 성능 비교 결과가 아닙니다. 합성 검사에는 노트북 자체 검사, 같은 CPU 조건에서 경로 이동 전후 재개 가중치의 일치, fit 캐시 없는 평가·추론, Colab 형식 가져오기와 제출 키 검사를 포함합니다. 2026-10-23에는 기존 WSL 전체 학습 결과를 별도로 분석했습니다. 실제 Colab 저장 파일은 제공되지 않아 가져오기는 합성 체크포인트로 검사했습니다. 새 분리 실험의 전체 데이터 성능·공식 점수·최종 공식 병합은 아직 검증하지 않았습니다.
+
+2026-10-23의 추가 검사에서는 새 실험 3종을 WSL의 44·352개 관측소 두 패널에서 BF16으로 각각 6 epoch 실행했습니다. N·ΔN 손실 구간 진입, adaptive 배치 8·4, 실험 사이 18개 일별 캐시 재사용을 확인했습니다. 이는 regime별 하루의 실행 검사입니다. 기존 50 epoch 모델의 재개 서명과 30개 패널·날짜 표본의 예측 점수도 그대로였으며, 기존 체크포인트·혼합 선택 파일의 해시를 유지했습니다. 합성 검사는 44개 중 42개 통과·Windows에서 실행할 수 없는 2개 건너뛰기였습니다.
+
+이후 원본 변경 감지·이동한 체크포인트의 혼합 파일 경로·추론 배치 적용에 대한 회귀 검사를 추가해 46개 중 44개 통과·2개 건너뛰기를 확인했습니다. WSL의 전체 학습용 2,450일 캐시는 원본 대조 후 출처 기록을 추가했고, 기존 NPZ를 다시 쓰지 않고 재개 서명을 유지했습니다. `full/` 밖으로 옮긴 체크포인트에서 혼합 선택 파일을 읽고 실제 배치 8로 validation 93,718행을 추론하는 것도 확인했습니다. 기존 50 epoch 모델·혼합 선택·학습 기록 파일은 보존했습니다.
+
+2026-10-23 추가 검증에서는 CUDA FP32 학습의 난수 상태를 AMP 사용 여부와 관계없이 저장·복원하도록 수정했습니다. 합성 데이터에서 연속 학습과 중단 후 재개의 가중치가 허용 오차 안에서 일치했으며, WSL에서 회귀 검사 47개가 모두 통과했습니다. `temporal_direct_dnzero`·`temporal_direct_learned_graph`를 실제 44·352개 관측소 두 패널에서 고정 배치 2·BF16으로 6 epoch 학습한 뒤 7 epoch까지 재개했습니다. ΔN 0 모델의 validation 93,718행·private 107,416행 예측도 템플릿 키·유한값·음수 여부 검사를 통과했습니다. 기존 전체 모델·혼합 선택·학습 기록의 해시와 공유 NPZ 2,757개의 수정 시각을 유지했습니다. 이는 소규모 실행 검증이며 새 두 실험의 전체 학습 성능을 검증한 결과는 아닙니다.

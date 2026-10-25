@@ -17,7 +17,7 @@ import torch
 from torch.nn import functional as F
 
 from data import (FEATURE_NAMES, STATE_CONTEXT_NAMES, PanelInfo, StationDay, TargetIndex, aggregate_channels,
-                  features_v2, ramp_features, slice_day, state_features_v2)
+                  features_v2, queue_features, queue_feature_names, ramp_features, slice_day, state_features_v2)
 from fast_model import TrafficQueueModel, TrafficStateModel
 
 
@@ -122,7 +122,40 @@ def state_examples(context, path):
     return samples
 
 
-def queue_examples(context, path, args, period):
+@lru_cache(maxsize=32)
+def masked_file_index(release, name, split):
+    folder = release / "corridors" / name / split / "mainline_states_masked"
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Released Queue origin needs masked inputs: {folder}")
+    result = {}
+    for path in sorted(folder.glob("**/*.parquet")):
+        match = re.search(r"\d{4}[-_]\d{2}[-_]\d{2}", path.name)
+        if not match:
+            raise ValueError(f"Masked file has no date: {path}")
+        date = match.group().replace("_", "-")
+        if date in result:
+            raise ValueError(f"Duplicate masked day: {name} {split} {date}")
+        result[date] = path
+    return result
+
+
+def released_origin_features(context, timestamp, ramp, cache):
+    """Read exactly T from the released masked layer, never fill it from truth."""
+    panel, date = context["panel"], timestamp[:10]
+    missing = np.full((1, len(panel.links)), np.nan, np.float32)
+    origin = StationDay([timestamp], panel.links, panel.links, np.arange(len(panel.links)), panel.lanes,
+                        missing, missing.copy(), np.zeros_like(missing, bool), missing.copy(), np.zeros_like(missing))
+    path = context["origin_paths"].get(date)
+    if path is not None:
+        if date not in cache:
+            cache[date] = StationDay.load(path, panel)
+        day = cache[date]
+        if timestamp in day.timestamps:
+            origin = slice_day(day, np.array([day.timestamps.index(timestamp)]))
+    return features_v2(origin, panel, context["profile"], ramp)
+
+
+def queue_examples(context, path, args, period, epoch=0):
     panel = context["panel"]
     day = StationDay.load(path, panel)
     steps, nodes = len(day.timestamps), len(panel.links)
@@ -143,21 +176,29 @@ def queue_examples(context, path, args, period):
         kind = ("onset" if not history.any() else "ongoing" if history[-1].any() else None) if future.any() else "normal"
         if kind is not None:
             candidates[kind].append(origin)
-    rng = np.random.default_rng(stable_seed(args.seed, panel.name, path.name, "queue"))
+    seed_parts = (args.seed, panel.name, path.name, "queue")
+    if period == "fit" and getattr(args, "queue_resample", False):
+        seed_parts += (epoch,)
+    rng = np.random.default_rng(stable_seed(*seed_parts))
+    condition_gap = getattr(args, "queue_condition_gap", False) if period == "fit" else getattr(args, "queue_validation_spread", False)
     chosen = []
     for kind in ("onset", "ongoing", "normal"):
         limit = args.normal_windows if kind == "normal" else args.windows_per_day
         for origin in rng.permutation(candidates[kind]):
             if sum(k == kind for k, _ in chosen) >= limit:
                 break
-            if all(abs(int(origin) - earlier) * 5 >= args.window_gap_minutes for _, earlier in chosen):
+            if all(abs(int(origin) - earlier) * 5 >= args.window_gap_minutes
+                   for other_kind, earlier in chosen if not condition_gap or other_kind == kind):
                 chosen.append((kind, int(origin)))
     ramp = ramp_features(context["release"], panel, "train", day.timestamps)
-    samples = []
+    samples, origin_cache = [], {}
     for kind, origin in chosen:
         index = np.arange(origin - 12, origin)
         future = slice(origin + 1, origin + 7)
-        x = features_v2(slice_day(day, index), panel, context["profile"], ramp[index])
+        released = (released_origin_features(context, day.timestamps[origin], ramp[origin:origin + 1], origin_cache)
+                    if getattr(args, "queue_origin", False) else None)
+        x = queue_features(slice_day(day, index), panel, context["profile"], ramp[index], released,
+                           getattr(args, "queue_changes", False))
         hard = queues[future].astype(np.float32)
         margin = panel.cutoffs[None] - minimum[future]
         soft = 1 / (1 + np.exp(-np.clip(margin / max(args.label_temperature, 1e-6), -30, 30))) if args.label_temperature > 0 else hard
@@ -307,7 +348,8 @@ def event(path, **values):
 
 
 def model_from_checkpoint(checkpoint, device):
-    if checkpoint.get("format_version") != 2 or tuple(checkpoint["feature_names"]) != FEATURE_NAMES:
+    expected = queue_feature_names(checkpoint["model_config"].get("queue_changes", False)) if checkpoint["task"] == "queue" else FEATURE_NAMES
+    if checkpoint.get("format_version") != 2 or tuple(checkpoint["feature_names"]) != expected:
         raise ValueError("Expected a v2 checkpoint with the current feature contract")
     cls = TrafficStateModel if checkpoint["task"] == "state" else TrafficQueueModel
     if checkpoint["task"] == "state" and checkpoint["model_config"].get("station_decoder", "linear") != "linear":
@@ -318,7 +360,7 @@ def model_from_checkpoint(checkpoint, device):
     return model
 
 
-def check_model_requests(args, config):
+def check_model_requests(args, config, queue=True):
     for key in ("graph", "missing_aware"):
         if getattr(args, key, False) and not config.get(key, False):
             raise ValueError(f"The checkpoint has {key}=False; use a new checkpoint to change the model")
@@ -330,6 +372,11 @@ def check_model_requests(args, config):
             raise ValueError(f"The checkpoint has a different {key}; use a new checkpoint to change the model")
     if getattr(args, "wavelet_input", None) is not None and args.wavelet_input != config.get("wavelet_input", "embedded"):
         raise ValueError("The checkpoint has a different wavelet_input; use a new checkpoint to change the model")
+    if queue:
+        for key, default in (("queue_head", "linear"), ("queue_changes", False)):
+            requested = getattr(args, key, default)
+            if requested != default and requested != config.get(key, default):
+                raise ValueError(f"The checkpoint has a different {key}; use a new checkpoint to change the model")
 
 
 def fit_regime_weights(item):
@@ -375,6 +422,11 @@ def contexts(args, task, checkpoint=None):
         else:
             profile = fit_profile(release, panel, fit_paths)
         context = {"panel": panel, "release": release, "profile": profile, "fit_paths": fit_paths}
+        if task == "queue" and getattr(args, "queue_origin", False):
+            context["origin_paths"] = masked_file_index(release, name, "train")
+            fit_set = set(fit_paths)
+            context["origin_fit_paths"] = [context["origin_paths"][date] for date, path in sorted(file_index(release, name).items())
+                                           if path in fit_set and date in context["origin_paths"]]
         if task == "state":
             first = StationDay.load(fit_paths[0], panel)
             context["targets"] = TargetIndex(release, name, first.station_ids)
@@ -397,15 +449,20 @@ def schedule(context, period, args, epoch):
         days = period_files(args.release_root, name, period, args.max_days)
         if period == "fit":
             rng.shuffle(days)
+        elif getattr(args, "queue_validation_spread", False) and days:
+            # Visit evenly spaced dates first; run_period takes at most one window per condition/day.
+            first = np.linspace(0, len(days) - 1, min(len(days), args.validation_windows)).round().astype(int).tolist()
+            chosen = set(first)
+            days = [days[i] for i in first] + [path for i, path in enumerate(days) if i not in chosen]
         paths.append([(name, path) for path in days])
     return [item for row in itertools.zip_longest(*paths) for item in row if item is not None]
 
 
-def prepared_days(context, items, args, task, period):
+def prepared_days(context, items, args, task, period, epoch=0):
     def prepare(item):
         name, path = item
         start = time.perf_counter()
-        samples = state_examples(context[name], path) if task == "state" else queue_examples(context[name], path, args, period)
+        samples = state_examples(context[name], path) if task == "state" else queue_examples(context[name], path, args, period, epoch)
         return name, path, samples, time.perf_counter() - start
     if args.workers == 0:
         for item in items:
@@ -556,14 +613,17 @@ def run_period(model, context, vocabulary, args, task, period, epoch, device, op
     items = schedule(context, period, args, epoch)
     if not items:
         raise ValueError(f"No days in {period}")
-    for number, (name, path, samples, prep) in enumerate(prepared_days(context, items, args, task, period), 1):
+    for number, (name, path, samples, prep) in enumerate(prepared_days(context, items, args, task, period, epoch), 1):
         preparation_seconds += prep
         if not training and task == "queue":
             selected = []
+            daily_seen = set()
             for sample in samples:
                 kind = sample["condition"]
-                if seen_conditions[name][kind] < args.validation_windows:
+                if (seen_conditions[name][kind] < args.validation_windows
+                        and (not getattr(args, "queue_validation_spread", False) or kind not in daily_seen)):
                     selected.append(sample)
+                    daily_seen.add(kind)
                     seen_conditions[name][kind] += 1
             samples = selected
         pending[name].extend(samples)
@@ -596,12 +656,17 @@ def run_period(model, context, vocabulary, args, task, period, epoch, device, op
             report["threshold"] = chosen
             report["baseline"] = queue_metrics(records, chosen, True)
             report["future_speed_rmse_kmh"] = float(np.sqrt(sum(row["speed_sse_kmh"] for row in records) / max(sum(row["count"] for row in records), 1)))
+            keys = sorted((row["panel"], row["date"], row["condition"], row["origin"]) for row in records)
+            report["window_signature"] = hashlib.sha256(json.dumps(keys).encode()).hexdigest()
+            report["validation_spread"] = getattr(args, "queue_validation_spread", False)
     return report, global_step
 
 
 def save_checkpoint(path, model, optimizer, scheduler, context, vocabulary, args, task, epoch, best, bad_epochs, step, report):
     payload = {"format_version": 2, "task": task, "weights": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-               "model_config": args.model_config, "feature_names": list(FEATURE_NAMES), "node_vocab": vocabulary,
+               "model_config": args.model_config,
+               "feature_names": list(queue_feature_names(args.model_config.get("queue_changes", False)) if task == "queue" else FEATURE_NAMES),
+               "node_vocab": vocabulary,
                "trained_panels": list(context), "links": {name: item["panel"].links for name, item in context.items()},
                "profiles": {name: torch.from_numpy(item["profile"]) for name, item in context.items()},
                "fit_signature": {name: signature(item["fit_paths"]) for name, item in context.items()},
@@ -614,6 +679,8 @@ def save_checkpoint(path, model, optimizer, scheduler, context, vocabulary, args
                "environment": {"python": sys.version, "torch": str(torch.__version__), "cuda": torch.version.cuda}}
     if task == "state":
         payload["state_context_names"] = list(STATE_CONTEXT_NAMES if model.station_decoder != "linear" else STATE_CONTEXT_NAMES[:3])
+    elif getattr(args, "queue_origin", False):
+        payload["origin_fit_signature"] = {name: signature(item["origin_fit_paths"]) for name, item in context.items()}
     temporary = path.with_suffix(path.suffix + ".pending")
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, temporary)
@@ -633,6 +700,8 @@ def train(args, task):
         raise ValueError("--graph-mode reliability requires --graph")
     if args.adaptive_graph_k < 0 or args.adaptive_graph_k == 1 or not 0 <= args.wavelet_levels <= 3:
         raise ValueError("--adaptive-graph-k must be 0 or at least 2; --wavelet-levels must lie in [0, 3]")
+    if min(args.validation_windows, args.windows_per_day) < 1 or args.normal_windows < 0 or args.window_gap_minutes < 0:
+        raise ValueError("Queue window limits must be positive, and normal windows/gap nonnegative")
     torch.set_num_threads(args.cpu_threads)
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -646,6 +715,13 @@ def train(args, task):
         raise ValueError("Resume checkpoint task mismatch")
     if resumed:
         check_model_requests(args, resumed["model_config"])
+        for key in ("queue_origin", "queue_resample", "queue_condition_gap", "queue_validation_spread"):
+            saved = resumed["training_args"].get(key, False)
+            if getattr(args, key, False) and not saved:
+                raise ValueError(f"Resume must retain {key}; use a new checkpoint to change Queue inputs/sampling")
+            setattr(args, key, saved)
+        args.queue_head = resumed["model_config"].get("queue_head", "linear")
+        args.queue_changes = resumed["model_config"].get("queue_changes", False)
         if args.state_regime_balance and not resumed["training_args"].get("state_regime_balance", False):
             raise ValueError("Resume must retain the loss; use a new checkpoint for regime balancing")
         # Restore settings that determine the data/loss; only the requested epoch budget and paths may change.
@@ -665,6 +741,8 @@ def train(args, task):
         for name, item in context.items():
             if signature(item["fit_paths"]) != resumed["fit_signature"][name]:
                 raise ValueError(f"Fit dataset changed since the checkpoint: {name}")
+            if args.queue_origin and signature(item["origin_fit_paths"]) != resumed["origin_fit_signature"][name]:
+                raise ValueError(f"Released Queue origin dataset changed since the checkpoint: {name}")
         vocabulary = resumed["node_vocab"]
         args.model_config = resumed["model_config"]
         model = model_from_checkpoint(resumed, device)
@@ -676,16 +754,19 @@ def train(args, task):
                              "missing_aware": args.missing_aware, "graph_mode": args.graph_mode,
                              "station_decoder": args.station_decoder, "adaptive_graph_k": args.adaptive_graph_k,
                              "wavelet_levels": args.wavelet_levels, "wavelet_input": args.wavelet_input or "signals"}
+        queue_config = {"queue_head": args.queue_head, "queue_changes": args.queue_changes,
+                        "features": len(queue_feature_names(args.queue_changes))} if task == "queue" else {}
+        args.model_config.update(queue_config)
         transfer = torch.load(args.init_state, map_location="cpu", weights_only=True) if task == "queue" and args.init_state else None
         if transfer:
             if transfer.get("format_version") != 2 or transfer["task"] != "state":
                 raise ValueError("Transfer needs a v2 State checkpoint")
-            check_model_requests(args, transfer["model_config"])
+            check_model_requests(args, transfer["model_config"], queue=False)
             if any(name not in transfer["profiles"] for name in context):
                 raise ValueError("The State checkpoint must cover the Queue panels")
             # Transfer fit-only statistics and identity mapping with the encoder.
             vocabulary = transfer["node_vocab"]
-            args.model_config = transfer["model_config"]
+            args.model_config = {**transfer["model_config"], **queue_config}
             for name, item in context.items():
                 if transfer["links"][name] != item["panel"].links:
                     raise ValueError("Transfer road layout mismatch")
@@ -694,7 +775,12 @@ def train(args, task):
                 item["profile"] = transfer["profiles"][name].numpy()
         model = (TrafficStateModel if task == "state" else TrafficQueueModel)(**args.model_config).to(device)
         if transfer:
-            model.encoder.load_state_dict({key.removeprefix("encoder."): value for key, value in transfer["weights"].items() if key.startswith("encoder.")})
+            weights = {key.removeprefix("encoder."): value for key, value in transfer["weights"].items() if key.startswith("encoder.")}
+            if args.queue_changes:
+                expanded = torch.zeros_like(model.encoder.input.weight, device="cpu")
+                expanded[:, :len(FEATURE_NAMES)] = weights["input.weight"]
+                weights["input.weight"] = expanded
+            model.encoder.load_state_dict(weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=device == "cuda")
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=args.scheduler_patience, factor=0.5)
     start_epoch, best, bad_epochs, step = 0, -float("inf"), 0, 0
@@ -724,7 +810,7 @@ def train(args, task):
         event(log, event="epoch", epoch=epoch + 1, fit_loss=fit["loss"], select_metric=metric, best_metric=best,
               learning_rate=optimizer.param_groups[0]["lr"], fit_seconds=fit["elapsed_seconds"],
               fit_windows_per_second=fit["windows_per_second"], improved=improved,
-              optimizer_updates=fit["optimizer_updates"], updates_by_panel=fit["updates_by_panel"])
+              fit_windows=fit["windows"], optimizer_updates=fit["optimizer_updates"], updates_by_panel=fit["updates_by_panel"])
         write_json(args.checkpoint.with_suffix(f".epoch{epoch + 1}.json"), select)
         save_checkpoint(args.checkpoint.with_name(args.checkpoint.stem + ".last.pt"), model, optimizer, scheduler, context, vocabulary, args, task, epoch, best, bad_epochs, step, select)
         if improved:
@@ -740,8 +826,13 @@ def evaluate(args):
     if checkpoint.get("format_version") != 2:
         raise ValueError("evaluate needs a v2 checkpoint; retain the previous audit for legacy scores")
     for key, value in checkpoint["training_args"].items():
-        if not hasattr(args, key):
+        if not hasattr(args, key) or getattr(args, key) is None:
             setattr(args, key, value)
+    if args.validation_windows is None:
+        args.validation_windows = checkpoint["training_args"]["validation_windows"]
+    if args.validation_windows < 1:
+        raise ValueError("--validation-windows must be positive")
+    args.queue_validation_spread = bool(getattr(args, "queue_validation_spread", False))
     args.seed = checkpoint["training_args"]["seed"]
     args.fixed_threshold = checkpoint["threshold"]
     args.bidirectional = checkpoint["bidirectional"]
@@ -864,6 +955,12 @@ def predict_queue_v2(model, checkpoint, release, split, output, selected=None, p
         if not (root / "sample_submission_queue.csv").exists():
             continue
         panel, profile, node_ids, edges = inference_context(checkpoint, release, name, device)
+        include_origin = checkpoint["training_args"].get("queue_origin", False)
+        changes = checkpoint.get("model_config", {}).get("queue_changes", False)
+        origin_context = {"panel": panel, "profile": profile}
+        if include_origin:
+            origin_context["origin_paths"] = masked_file_index(release, name, split)
+        origin_cache = {}
         template = pd.read_csv(root / "sample_submission_queue.csv", dtype=str)
         index = pd.read_csv(root / "window_index.csv", dtype=str).set_index("window_id")
         history = pd.read_parquet(root / "window_history.parquet")
@@ -882,8 +979,11 @@ def predict_queue_v2(model, checkpoint, release, split, output, selected=None, p
                 raise ValueError(f"Unexpected Task 2 time boundary: {window_id}")
             if not set(target.link_id).issubset(panel.link_index):
                 raise ValueError("Unknown Queue target link")
-            ramp = ramp_features(release, panel, split, day.timestamps)
-            inputs.append({"x": features_v2(day, panel, profile, ramp)})
+            timestamp = origin.strftime("%Y-%m-%dT%H:%M:%SZ")
+            ramp_times = day.timestamps + ([timestamp] if include_origin else [])
+            ramp = ramp_features(release, panel, split, ramp_times)
+            released = released_origin_features(origin_context, timestamp, ramp[-1:], origin_cache) if include_origin else None
+            inputs.append({"x": queue_features(day, panel, profile, ramp[:12], released, changes)})
             targets.append((target, future))
         size = 48 if len(panel.links) <= 128 else 12
         for start in range(0, len(inputs), size):
