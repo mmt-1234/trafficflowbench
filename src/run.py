@@ -309,27 +309,37 @@ def solve_odme(matrix, observed, base, lam, prior_power=0, prior_floor_ratio=0.1
             or not np.isfinite(observed).all() or (observed < 0).any()
             or not np.isfinite(design.data).all() or (design.data < 0).any()):
         raise ValueError("Invalid ODME matrix/count dimensions or values")
+    # Scaling both vectors preserves the minimizer and avoids large-cost cancellation.
+    flow_scale = max(1.0, float(base.max()), float(observed.max()))
+    base, observed = base / flow_scale, observed / flow_scale
     if lam == 0:
         result = lsq_linear(design, observed, bounds=(0, np.inf), tol=1e-8, max_iter=2000)
-        if not result.success:
+        flow = result.x * flow_scale
+        if not result.success or not np.isfinite(flow).all():
             raise RuntimeError(f"ODME solver did not converge: {result.message}")
-        return result.x
+        return flow
     precision = lam / variance
     if not np.isfinite(precision).all() or (precision <= 0).any():
         raise ValueError("ODME prior precision is outside the numerical range")
+    prior_residual = observed - design @ base
     # The dual has one variable per measured link, independent of path count.
     def objective(dual):
-        flow = np.maximum(base - np.asarray(design.T @ dual).ravel() / precision, 0)
-        cost = 0.5 * (dual @ dual) + observed @ dual + 0.5 * np.dot(precision * (flow - base), flow + base)
-        return cost, dual + observed - design @ flow
+        projected = np.asarray(design.T @ dual).ravel()
+        correction = np.minimum(projected / precision, base)
+        # Centering at the prior removes cancellation between the large linear terms.
+        cost = (0.5 * (dual @ dual) + prior_residual @ dual
+                + np.dot(projected - 0.5 * precision * correction, correction))
+        return cost, dual + prior_residual + design @ correction
     result = minimize(objective, np.zeros(len(observed)), jac=True, method="BFGS",
-                      options={"gtol": 1e-5, "maxiter": 2000})
+                      options={"gtol": min(1e-9, 1e-5 / flow_scale), "maxiter": 2000})
     flow = np.maximum(base - np.asarray(design.T @ result.x).ravel() / precision, 0)
     residual, difference = design @ flow - observed, flow - base
     primal = 0.5 * (residual @ residual + np.dot(precision * difference, difference))
     # Clipped flows minimize the Lagrangian; this gap avoids subtracting large costs.
     gap = 0.5 * np.sum((result.x - residual) ** 2)
-    if not np.isfinite(flow).all() or not np.isfinite(primal + gap) or gap > 1e-7 * (1 + primal):
+    flow *= flow_scale
+    if (not np.isfinite(flow).all() or not np.isfinite(primal + gap)
+            or gap > 1e-7 * ((1 / flow_scale) ** 2 + primal)):
         raise RuntimeError(f"ODME solver did not converge: {result.message}")
     return flow
 

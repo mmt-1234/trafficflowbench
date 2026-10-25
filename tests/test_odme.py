@@ -70,6 +70,33 @@ class OdmeContracts(unittest.TestCase):
                 np.testing.assert_array_equal(odme_prior_variance(np.zeros(3), power), np.ones(3))
         np.testing.assert_allclose(solve_odme(np.eye(2), [1, 2], [0, 0], 0, 2), [1, 2], atol=1e-6)
 
+    def test_large_flow_scale_matches_feasible_analytic_solution(self):
+        rng = np.random.default_rng(20261025)
+        rows, columns, index = [], [], 0
+        for start in range(100):
+            for stop in range(start + 1, 101):
+                rows.extend(range(start, stop))
+                columns.extend([index] * (stop - start))
+                index += 1
+        matrix = csr_matrix((np.ones(len(rows)), (rows, columns)), shape=(100, index))
+        unit_prior = rng.lognormal(2, 1.2, index)
+        unit_counts = matrix @ (unit_prior * (1 + rng.normal(0, 0.001, index)))
+        for scale in (1, 1000):
+            prior, counts = unit_prior * scale, unit_counts * scale
+            for power in (0, 1, 2):
+                variance = (prior + 0.1 * np.median(prior)) ** power
+                variance /= np.median(variance)
+                for lam in (0.01, 0.05, 0.2):
+                    with self.subTest(scale=scale, power=power, lam=lam):
+                        inverse_precision = variance / lam
+                        hessian = (matrix.multiply(inverse_precision) @ matrix.T).toarray() + np.eye(100)
+                        dual = np.linalg.solve(hessian, matrix @ prior - counts)
+                        expected = prior - inverse_precision * (matrix.T @ dual)
+                        self.assertGreater(expected.min(), 0)
+                        actual = solve_odme(matrix, counts, prior, lam, power)
+                        relative_error = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+                        self.assertLess(relative_error, 1e-5)
+
     def test_invalid_solver_inputs_are_rejected(self):
         cases = [dict(lam=-1), dict(lam=np.nan), dict(lam=np.inf), dict(prior_power=3),
                  dict(prior_floor_ratio=0), dict(prior_floor_ratio=np.nan)]

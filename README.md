@@ -485,7 +485,11 @@ env CHECKPOINT_DIR=artifacts/v2-signal-split \
 
 ### Task 4: 가중 Prior NNLS
 
+[task4_odme_colab.ipynb](notebooks/task4_odme_colab.ipynb)는 같은 기능의 독립형 Colab 노트북입니다. CPU 런타임에서 Drive를 연결하고 `RELEASE_ROOT`를 지정한 뒤 위에서부터 실행합니다. 함수는 모두 셀 안에 있으며, 후보 비교표·그래프와 validation·private의 Task 4 CSV를 저장합니다. CSV 생성 기본값은 기존 baseline이고, 후보 비교 결과는 예측 설정에 자동 적용하지 않습니다. 예측은 실행마다 `predictions/run-<id>/`에 저장하고, 양쪽 split·합본·설정이 모두 완성된 경우에만 `predictions/latest.json`을 갱신합니다. 최신 합본 경로는 이 파일의 `combined_path`입니다. 중단된 `.pending-<id>/` 폴더는 미완료 결과이며 이전 완료 파일은 유지됩니다. 생성 파일은 Task 4 전용이므로 최종 Kaggle 제출 전 다른 과제와 병합해야 합니다.
+
 Task 4는 해당 split의 관측 링크만 희소 행렬로 읽고 다음 문제를 풉니다. 기본값 `p=0`, `λ=0.05`는 기존 정규화 NNLS와 같은 목적함수입니다. 데이터 다운로드나 신경망 학습은 수행하지 않습니다.
+
+솔버는 Prior와 관측 교통량을 같은 배율로 정규화해 계산하고 결과를 원래 단위로 복원합니다. 목적함수와 해의 의미는 유지하며, 큰 수요값에서의 수치 오차를 줄입니다.
 
 ```text
 minimize over f >= 0: ||A_measured f - c_measured||² + λ sum_i (f_i-b_i)² / v_i
