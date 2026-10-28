@@ -540,3 +540,19 @@ Task 4 예측만 저장하려면 아래 명령을 사용합니다. `--prior-powe
 ```
 
 이전 9채널 체크포인트의 1월 재평가 값은 State 정규화 MSE 0.009547, Queue 대리 IoU 0.4548입니다. 새 v2와 다른 마스크·라벨·집계 조건이므로 직접 성능 비교하지 않습니다. 전체 v2 학습·여러 seed 성능 비교·Kaggle 점수 재현은 아직 수행하지 않았습니다. [검증 기록](MODEL_AUDIT.md)
+
+## 12. Colab: Task 1·2·3 통합 노트북
+
+[task123_colab.ipynb](notebooks/task123_colab.ipynb)는 [Kaggle용 task123 노트북](notebooks/task123_kaggle.ipynb)의 모델·학습·평가·제출 병합을 유지한 Colab용 파일입니다. GPU 런타임에서 Drive를 연결하고, 첫 설정 셀의 `RELEASE_ROOT`를 기존 데이터 폴더로 지정해 주세요. 해당 폴더 또는 바로 아래 `kaggle_public/`를 인식합니다. 기본 `RUN_MODE="smoke"`로 한 패널을 점검한 뒤 전체 학습은 `RUN_MODE="train"`, `PANELS=None`으로 실행합니다.
+
+캐시와 입력 연결은 임시 디스크의 `WORK_ROOT=/content/trafficflow_task123`에 두고, 모델·보고서·예측은 Drive의 `SAVE_ROOT=/content/drive/MyDrive/dataset/trafficflow_task123`에 바로 저장합니다. 최종 제출은 `SAVE_ROOT/submission.csv`입니다. 같은 결과를 재개할 때는 `RESUME=True`로 설정하고, 기존 Kaggle Output을 가져올 때는 Drive에 올린 `trafficflow_task123/` 폴더를 `RESTORE_ROOT`로 지정합니다. 복원은 임시 폴더에 완료한 뒤 확정하므로 중단된 복사본이 재시도를 막지 않습니다. 복원 후에는 `RESTORE_ROOT=None`으로 사용합니다. Queue 재개는 원본 파일 크기·수정 시각도 검사하므로 데이터 사본의 메타데이터를 유지해야 합니다. 저장된 BF16과 GPU의 호환성은 긴 학습 전에 확인하고, 평가·추론은 미지원 장치에서 FP32를 사용합니다.
+
+기존 Task 4 결과가 있으면 `TASK4_FILES`에 validation·private를 모두 포함하는 CSV 경로를 지정해 주세요. 없으면 기존 NNLS baseline을 사용합니다. 기본 Mamba2 backend는 패키지 설치 후 GPU에서 순전파·역전파를 먼저 확인합니다.
+
+Task 3은 기존 기본 손실 `N=0.05, dN=0.03`을 `current003`으로 보존하고, `baseline010=(0.05, 0.10)`, `dn020=(0.05, 0.20)`, `both020=(0.10, 0.20)`을 비교합니다. 새 학습 기본값 `PHYSICS_PRESET="dn020"`은 성능을 검증할 후보이며, 설정별 결과 폴더를 분리합니다. 공유 `AMSTenc` 파라미터의 State/N/dN 기울기 크기·방향, 가중 물리/State 비율, `dN` 정규화 분모·표본 수를 `gradient_diagnostics.csv`에 기록합니다. `GRADIENT_EVERY=0`이면 이 진단을 끕니다. 자동 가중치 조절과 손실 정규화 변경은 진단 후 별도 비교 대상으로 둡니다.
+
+Task 2의 새 학습은 검증 구간에 관측 링크 기준 과거 관측률 70% 이상, 미래 정체 존재, persistence IoU 0.9 이하, 조건별 최소 간격 360분을 적용합니다. 비공개 정답을 사용하는 공식 평가와 달리 공개 관측 속도로 만든 대리 검증입니다. `CALIBRATE_QUEUE=True`이면 고정된 1월 검증 구간의 확률을 캐시하고 원래 임계값, 전부 0인 window의 최대 확률 한 곳만 1로 만드는 후보, 전역·조건별 임계값을 비교합니다. 선택값은 체크포인트 해시에 연결하며 `RUN_FEBRUARY=True`일 때 2월에 고정 적용합니다. [공식 구간 선정 설정](https://github.com/jacky850/trafficflowbench-public/blob/main/config/synthetic_release_v1.json), [공식 평가 명세](https://github.com/jacky850/trafficflowbench-public/blob/main/docs/SCORING_SPEC.md), 확인일: 2026-10-28.
+
+기존 모델로 재학습 없이 비교하려면 `RUN_MODE="predict"`, `PHYSICS_PRESET=None`, 원래 `MAGINET_EXPERIMENT`·`QUEUE_TAG`·`QUEUE_BACKEND`를 지정합니다. 새 Queue 학습의 기본 tag는 `public-validation-v1`이며, 기존 `enhanced` 결과와 분리합니다. `CALIBRATE_QUEUE=False`이면 저장된 선택값을 사용하고 없으면 원래 임계값을 사용합니다. 선택에 필요한 1월 원본과 train masked 자료는 유지해 주세요.
+
+Queue 결과 폴더의 `calibration-public-v1/`에는 정책 비교표, 고정 검증 목록·확률, window별·5~30분별 TP/FP/FN과 정체 개수, 1월 선택값과 2월 고정 비교를 저장합니다. validation/private 추론은 선택된 0/1 CSV와 함께 `-baseline.csv`, `-probabilities.csv`를 저장합니다. 확률 파일의 값 열은 `queue_probability`이며 제출 파일이 아닙니다. `QUEUE_REFERENCE_SUBMISSION`에 이전 전체 제출 CSV를 지정하면 원래 임계값 출력과의 차이를 기록합니다. 새 후보의 점수 개선 여부는 동일 조건의 실제 데이터 비교로 판단해야 합니다.
