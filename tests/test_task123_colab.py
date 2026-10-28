@@ -205,6 +205,70 @@ class Task123ColabTests(Task123NotebookRegressions, unittest.TestCase):
 class Task123KaggleTests(Task123NotebookRegressions, unittest.TestCase):
     notebook = KAGGLE_NOTEBOOK
 
+    def test_task1_profile_is_read_from_previous_cache_without_recomputing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous, current = root / 'previous', root / 'current'
+            panel = SimpleNamespace(name='P_N', links=['l0'])
+            targets = SimpleNamespace(stations=['s0'], links=['l0'])
+            dates = ['2030-06-01']
+            metadata = dict(format='maginet-input-v1', panel='P_N', links=['l0'], stations=['s0'],
+                            station_links=['l0'], fit_dates=dates, aux_names=['quality'], scale=[25., 600.])
+            key = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()[:16]
+            folder = previous / 'metadata/profiles/P_N' / key
+            folder.mkdir(parents=True)
+            profile = np.ones((2016, 1, 3), np.float32)
+            path = folder / 'fit_profile.npy'
+            np.save(path, profile)
+            (folder / 'cache_metadata.json').write_text(json.dumps(metadata))
+            marker = path.with_suffix('.sources.json')
+            marker.write_text(json.dumps('same-input'))
+            before = {p: p.read_bytes() for p in folder.iterdir()}
+            namespace = dict(np=np, json=json, hashlib=hashlib, shutil=shutil,
+                             CACHE_METADATA_DIR=current / 'metadata', CACHE_ROOT=current,
+                             CACHE_CONTAINER=current, CACHE_PROFILE_DIR=current / 'legacy_profiles',
+                             CACHE_SOURCE_DIR=previous, CACHE_MODE='reuse', AUX_NAMES=('quality',),
+                             SCALE=np.array([25., 600.]), profile_source_signature=lambda *a: 'same-input',
+                             fit_prior=lambda *a: self.fail('Previous profile must not be recomputed'))
+            functions(embedded('maginet', self.notebook), ['load_fit_profile', 'cache_is_current'], namespace)
+            np.testing.assert_array_equal(namespace['load_fit_profile'](panel, targets, dates, {}), profile)
+            self.assertEqual(before, {p: p.read_bytes() for p in folder.iterdir()})
+            self.assertFalse(list(current.rglob('*.npy')))
+            marker.write_text(json.dumps('different-input'))
+            with self.assertRaisesRegex(ValueError, '재사용 가능한 과거 평균'):
+                namespace['load_fit_profile'](panel, targets, dates, {})
+            marker.write_text(json.dumps('same-input'))
+            (folder / 'cache_metadata.json').write_text(json.dumps({**metadata, 'fit_dates': ['2031-01-01']}))
+            with self.assertRaisesRegex(ValueError, '학습 날짜'):
+                namespace['load_fit_profile'](panel, targets, dates, {})
+
+    def test_task1_day_cache_uses_previous_npz_and_rejects_missing_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous, current = root / 'previous', root / 'current'
+            folder = previous / 'inputs/key/P_N/fit'
+            folder.mkdir(parents=True)
+            path = folder / '2030-06-01.npz'
+            np.savez_compressed(path, target=np.ones((1, 1), bool))
+            marker = path.with_suffix('.sources.json')
+            marker.write_text(json.dumps('same-input'))
+            before = path.read_bytes()
+            namespace = dict(np=np, json=json, CACHE_SOURCE_DIR=previous, CACHE_MODE='reuse',
+                             TRAIN_MODEL=False, MASK_RESAMPLE=False,
+                             time=SimpleNamespace(perf_counter=lambda: 0.),
+                             day_source_signature=lambda *a: 'same-input',
+                             validate_cache_targets=lambda *a: ('R1', 1),
+                             make_day=lambda *a: self.fail('Previous NPZ must not be regenerated'))
+            functions(embedded('maginet', self.notebook), ['cache_context', 'cache_is_current'], namespace)
+            context = dict(panel=SimpleNamespace(name='P_N'), dates={'fit': ['2030-06-01']}, cache_key='key')
+            entries = namespace['cache_context'](context, current, periods=('fit',))
+            self.assertEqual(entries[0]['path'], str(path))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertFalse(list(current.rglob('*.npz')))
+            marker.unlink()
+            with self.assertRaisesRegex(FileNotFoundError, '출처'):
+                namespace['cache_context'](context, current, periods=('fit',))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -166,7 +166,7 @@ class Task123Notebook(unittest.TestCase):
             release_fixture(release)
             ns = {"display": lambda value: None}
             exec(tagged("configuration"), ns)
-            ns.update(RELEASE_ROOT=str(release), WORK_ROOT=root / "working/trafficflow_task123",
+            ns.update(RELEASE_ROOT=str(release), WORK_ROOT=root / "working/trafficflow_task123", TASK1_CACHE_ROOT=None,
                       INSTALL_MISSING_PACKAGES=False, CPU_THREADS=1, USE_RETRIEVAL=False, RESUME=True)
             with patch("torch.cuda.is_available", return_value=False), contextlib.redirect_stdout(io.StringIO()):
                 for cell in notebook()["cells"]:
@@ -208,7 +208,7 @@ class Task123Notebook(unittest.TestCase):
                       for p in release.rglob("*") if p.is_file()}
             ns = {"display": lambda value: None}
             exec(compile(tagged("configuration"), "configuration", "exec"), ns)
-            ns.update(RELEASE_ROOT=str(release), WORK_ROOT=root / "working/trafficflow_task123",
+            ns.update(RELEASE_ROOT=str(release), WORK_ROOT=root / "working/trafficflow_task123", TASK1_CACHE_ROOT=None,
                       INSTALL_MISSING_PACKAGES=False, CPU_THREADS=1, RUN_FEBRUARY=True)
             log = io.StringIO()
             with patch("torch.cuda.is_available", return_value=False), contextlib.redirect_stdout(log):
@@ -284,7 +284,7 @@ class Task123Notebook(unittest.TestCase):
                 restored = {"display": lambda value: None}
                 exec(compile(tagged("configuration"), "configuration", "exec"), restored)
                 restored.update(RUN_MODE="predict", RELEASE_ROOT=str(release), WORK_ROOT=root / "restored/trafficflow_task123",
-                                RESTORE_ROOT=previous, QUEUE_BACKEND="scan", TASK4_FILES=odme_files,
+                                RESTORE_ROOT=previous, QUEUE_BACKEND="scan", TASK4_FILES=odme_files, TASK1_CACHE_ROOT=None,
                                 INSTALL_MISSING_PACKAGES=False, CPU_THREADS=1)
                 selection = previous / "reports/full/maginet" / ns["MAGINET_EXPERIMENT"] / "retrieval/selected_retrieval.json"
                 selected_before = selection.read_bytes()
@@ -306,7 +306,7 @@ class Task123Notebook(unittest.TestCase):
                 portable = {"display": lambda value: None}
                 exec(tagged("configuration"), portable)
                 portable.update(RUN_MODE="predict", RELEASE_ROOT=str(inference), WORK_ROOT=root / "portable/trafficflow_task123",
-                                RESTORE_ROOT=previous, QUEUE_BACKEND="scan", TASK4_FILES=odme_files,
+                                RESTORE_ROOT=previous, QUEUE_BACKEND="scan", TASK4_FILES=odme_files, TASK1_CACHE_ROOT=None,
                                 INSTALL_MISSING_PACKAGES=False, CPU_THREADS=1, USE_RETRIEVAL=False)
                 for cell in notebook()["cells"]:
                     if cell["cell_type"] == "code" and "configuration" not in cell.get("metadata", {}).get("tags", []):
