@@ -93,8 +93,54 @@ class Task123NotebookRegressions:
         self.assertTrue(all(sample['condition'] != 'normal' for sample in samples))
         self.assertEqual([sample['origin'] for sample in samples], [sample['origin'] for sample in
                          namespace['queue_examples'](context, Path('states_2031-01-01.parquet'), args, 'select')])
+        args.queue_sampling_version = 3
+        fit = namespace['queue_examples'](context, Path('states_2031-01-01.parquet'), args, 'fit')
+        self.assertTrue(fit)
+        self.assertTrue(all(not sample['mask'][:, 1:].any() for sample in fit))
+        # A checkpoint without the version field keeps its original fit coverage.
+        del args.queue_sampling_version
+        self.assertEqual(namespace['queue_examples'](context, Path('states_2031-01-01.parquet'), args, 'fit'), [])
         day.speed[:] = 40. / 25
         self.assertEqual(namespace['queue_examples'](context, Path('states_2031-01-01.parquet'), args, 'select'), [])
+
+    def test_fit_queue_conditions_use_target_history_and_include_recurrence(self):
+        count = 36
+        panel = SimpleNamespace(name='P_N', links=['target', 'other', 'connector'], cutoffs=np.full(3, 60.))
+        day = SimpleNamespace(timestamps=[f'2031-01-01T{slot // 12:02d}:{slot % 12 * 5:02d}:00Z'
+                                          for slot in range(count)], station_to_link=np.array([0, 1]),
+                              speed=np.full((count, 2), 90. / 25), eligible=np.ones((count, 2), bool))
+        day.speed[20:, 0] = 40. / 25
+        day.speed[:, 1] = 40. / 25
+        args = SimpleNamespace(queue_sampling_version=3, queue_public_contract=True,
+                               history_coverage=.5, future_coverage=.5, queue_resample=False,
+                               queue_validation_spread=True, queue_condition_gap=True, windows_per_day=count,
+                               normal_windows=0, window_gap_minutes=0, seed=42, queue_origin=False,
+                               queue_changes=False, label_temperature=0., uncertainty_margin=0.)
+        namespace = dict(np=np, hashlib=hashlib,
+                         QUEUE_PUBLIC_CONTRACT=dict(minimum_history_coverage=.7, maximum_persistence_iou=.9,
+                                                    minimum_spacing_minutes=360),
+                         StationDay=SimpleNamespace(load=lambda path, p: day),
+                         aggregate_channels=lambda *a: (np.zeros((count, 3, 3)), None, None),
+                         ramp_features=lambda *a: np.zeros((count, 3, 4)),
+                         slice_day=lambda *a: None, queue_features=lambda *a: np.zeros((12, 3, 44)))
+        functions(embedded('learning', self.notebook), ['queue_examples', 'stable_seed', 'iou'], namespace)
+        context = dict(panel=panel, release=Path('/unused'), profile=None, queue_target_nodes=np.array([0]))
+        path = Path('states_2031-01-01.parquet')
+        samples = namespace['queue_examples'](context, path, args, 'fit')
+        self.assertTrue(any(sample['condition'] == 'onset' for sample in samples))
+        self.assertTrue(all(sample['mask'][:, 0].all() and not sample['mask'][:, 1:].any() for sample in samples))
+
+        day.speed[:] = 90. / 25
+        day.speed[:2, 0] = 40. / 25
+        day.speed[16:, 0] = 40. / 25
+        samples = namespace['queue_examples'](context, path, args, 'fit')
+        recurrence = next(sample for sample in samples if sample['origin'] == 12)
+        self.assertEqual(recurrence['condition'], 'ongoing')
+        public = namespace['queue_examples'](context, path, args, 'select')
+        self.assertTrue(public)
+        self.assertTrue(any(sample['condition'] == 'ongoing' and sample['origin'] in (12, 13) for sample in public))
+        args.queue_sampling_version = 2
+        self.assertNotIn(12, [sample['origin'] for sample in namespace['queue_examples'](context, path, args, 'fit')])
 
     def test_holdout_cannot_select_thresholds(self):
         helper = functions(embedded('learning', self.notebook), ['calibrate_queue'], {})['calibrate_queue']
