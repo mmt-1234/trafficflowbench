@@ -35,7 +35,7 @@ def functions(source, names, namespace):
     return namespace
 
 
-class QueueNotebookRegressions:
+class Task123NotebookRegressions:
     def test_cells_and_embedded_source_hashes(self):
         notebook = json.loads(self.notebook.read_text())
         for index, cell in enumerate(notebook['cells']):
@@ -115,8 +115,22 @@ class QueueNotebookRegressions:
         self.assertEqual(metrics['proxy_IoU'], 0.)
         self.assertFalse(details.empty_before.iloc[0])
 
+    def test_gradient_probe_does_not_accumulate_parameter_gradients(self):
+        import torch
+        namespace = dict(torch=torch, np=np, LOSS_WEIGHTS={'N': .05, 'dN': .2})
+        probe = functions(embedded('maginet', self.notebook), ['loss_gradient_diagnostics'], namespace)['loss_gradient_diagnostics']
+        parameter = torch.tensor([2.], requires_grad=True)
+        losses = dict(State=parameter.square().sum(), N=-parameter.sum(), dN=2 * parameter.sum())
+        result = probe(losses, [parameter], .5)
+        self.assertIsNone(parameter.grad)
+        self.assertAlmostEqual(result['cos_State_N'], -1.)
+        self.assertAlmostEqual(result['cos_State_dN'], 1.)
+        self.assertAlmostEqual(result['weighted_grad_physics'], .175, places=6)
+        (losses['State'] + .5 * (.05 * losses['N'] + .2 * losses['dN'])).backward()
+        self.assertAlmostEqual(float(parameter.grad[0]), 4.175, places=5)
 
-class Task123ColabTests(QueueNotebookRegressions, unittest.TestCase):
+
+class Task123ColabTests(Task123NotebookRegressions, unittest.TestCase):
     notebook = NOTEBOOK
 
     def test_interrupted_restore_can_retry_without_partial_reports(self):
@@ -141,22 +155,8 @@ class Task123ColabTests(QueueNotebookRegressions, unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 namespace['restore_reports'](source, target)
 
-    def test_gradient_probe_does_not_accumulate_parameter_gradients(self):
-        import torch
-        namespace = dict(torch=torch, np=np, LOSS_WEIGHTS={'N': .05, 'dN': .2})
-        probe = functions(embedded('maginet'), ['loss_gradient_diagnostics'], namespace)['loss_gradient_diagnostics']
-        parameter = torch.tensor([2.], requires_grad=True)
-        losses = dict(State=parameter.square().sum(), N=-parameter.sum(), dN=2 * parameter.sum())
-        result = probe(losses, [parameter], .5)
-        self.assertIsNone(parameter.grad)
-        self.assertAlmostEqual(result['cos_State_N'], -1.)
-        self.assertAlmostEqual(result['cos_State_dN'], 1.)
-        self.assertAlmostEqual(result['weighted_grad_physics'], .175, places=6)
-        (losses['State'] + .5 * (.05 * losses['N'] + .2 * losses['dN'])).backward()
-        self.assertAlmostEqual(float(parameter.grad[0]), 4.175, places=5)
 
-
-class Task123KaggleTests(QueueNotebookRegressions, unittest.TestCase):
+class Task123KaggleTests(Task123NotebookRegressions, unittest.TestCase):
     notebook = KAGGLE_NOTEBOOK
 
 
