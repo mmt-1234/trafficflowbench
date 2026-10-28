@@ -1,4 +1,4 @@
-"""Focused regressions for the standalone Colab notebook; no real data or GPU."""
+"""Focused regressions for the standalone Task123 notebooks; no real data or GPU."""
 import ast
 import hashlib
 import json
@@ -13,16 +13,17 @@ import numpy as np
 
 
 NOTEBOOK = Path(__file__).resolve().parents[1] / 'notebooks/task123_colab.ipynb'
+KAGGLE_NOTEBOOK = NOTEBOOK.with_name('task123_kaggle.ipynb')
 
 
-def tagged(tag):
-    notebook = json.loads(NOTEBOOK.read_text())
+def tagged(tag, path=NOTEBOOK):
+    notebook = json.loads(path.read_text())
     return ''.join(next(cell['source'] for cell in notebook['cells']
                         if tag in cell.get('metadata', {}).get('tags', [])))
 
 
-def embedded(name):
-    call = ast.parse(tagged(name)).body[0].value
+def embedded(name, path=NOTEBOOK):
+    call = ast.parse(tagged(name, path)).body[0].value
     return ast.literal_eval(call.args[1])
 
 
@@ -34,9 +35,9 @@ def functions(source, names, namespace):
     return namespace
 
 
-class Task123ColabTests(unittest.TestCase):
+class QueueNotebookRegressions:
     def test_cells_and_embedded_source_hashes(self):
-        notebook = json.loads(NOTEBOOK.read_text())
+        notebook = json.loads(self.notebook.read_text())
         for index, cell in enumerate(notebook['cells']):
             if cell['cell_type'] == 'code':
                 tree = ast.parse(''.join(cell['source']), filename=f'cell-{index}')
@@ -46,30 +47,8 @@ class Task123ColabTests(unittest.TestCase):
                                      notebook['metadata']['trafficflow']['source_sha256'][name])
                     compile(ast.parse(source), name, 'exec')
 
-    def test_interrupted_restore_can_retry_without_partial_reports(self):
-        namespace = functions(tagged('environment'), ['restore_reports'],
-                              dict(Path=Path, shutil=shutil, tempfile=tempfile))
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source, target = root / 'previous/reports', root / 'current/reports'
-            source.mkdir(parents=True)
-            (source / 'model.pt').write_bytes(b'complete checkpoint')
-
-            def interrupt(previous, pending, **kwargs):
-                (pending / 'model.pt').write_bytes(b'partial')
-                raise InterruptedError('interrupted copy')
-
-            with patch.object(shutil, 'copytree', side_effect=interrupt):
-                with self.assertRaises(InterruptedError):
-                    namespace['restore_reports'](source, target)
-            self.assertFalse(target.exists())
-            namespace['restore_reports'](source, target)
-            self.assertEqual((target / 'model.pt').read_bytes(), b'complete checkpoint')
-            with self.assertRaises(FileExistsError):
-                namespace['restore_reports'](source, target)
-
     def test_nonempty_adds_only_one_target_and_keeps_existing_positives(self):
-        decide = functions(embedded('learning'), ['queue_decisions'], {'np': np})['queue_decisions']
+        decide = functions(embedded('learning', self.notebook), ['queue_decisions'], {'np': np})['queue_decisions']
         probability = np.array([[.1, .4], [.3, .99]])
         valid = np.array([[True, True], [True, False]])
         predicted = decide(probability, .5, valid, True)
@@ -81,7 +60,7 @@ class Task123ColabTests(unittest.TestCase):
 
     def test_bf16_resume_rejects_unsupported_device_and_inference_uses_fp32(self):
         fake_torch = SimpleNamespace(cuda=SimpleNamespace(is_bf16_supported=lambda: False))
-        helper = functions(embedded('learning'), ['checkpoint_bf16'], {'torch': fake_torch})['checkpoint_bf16']
+        helper = functions(embedded('learning', self.notebook), ['checkpoint_bf16'], {'torch': fake_torch})['checkpoint_bf16']
         checkpoint = {'training_args': {'use_bf16': True}}
         with self.assertRaises(ValueError):
             helper(checkpoint, 'cuda', strict=True)
@@ -107,7 +86,7 @@ class Task123ColabTests(unittest.TestCase):
                          aggregate_channels=lambda *a: (np.zeros((count, 3, 3)), None, None),
                          ramp_features=lambda *a: np.zeros((count, 3, 4)),
                          slice_day=lambda *a: None, queue_features=lambda *a: np.zeros((12, 3, 44)))
-        functions(embedded('learning'), ['queue_examples', 'stable_seed', 'iou'], namespace)
+        functions(embedded('learning', self.notebook), ['queue_examples', 'stable_seed', 'iou'], namespace)
         context = dict(panel=panel, release=Path('/unused'), profile=None)
         samples = namespace['queue_examples'](context, Path('states_2031-01-01.parquet'), args, 'select')
         self.assertTrue(samples)
@@ -118,14 +97,14 @@ class Task123ColabTests(unittest.TestCase):
         self.assertEqual(namespace['queue_examples'](context, Path('states_2031-01-01.parquet'), args, 'select'), [])
 
     def test_holdout_cannot_select_thresholds(self):
-        helper = functions(embedded('learning'), ['calibrate_queue'], {})['calibrate_queue']
+        helper = functions(embedded('learning', self.notebook), ['calibrate_queue'], {})['calibrate_queue']
         with self.assertRaisesRegex(ValueError, '1월'):
             helper([], {'config': {'period': 'holdout'}}, None, None, [.5])
 
     def test_nonempty_policy_cannot_use_future_eligibility_to_choose_a_cell(self):
         import pandas as pd
         namespace = dict(np=np, pd=pd)
-        functions(embedded('learning'), ['queue_decisions', 'queue_policy_metrics', 'queue_metrics',
+        functions(embedded('learning', self.notebook), ['queue_decisions', 'queue_policy_metrics', 'queue_metrics',
                                          'family_mean', 'iou'], namespace)
         row = dict(panel='P_N', condition='onset', date='2031-01-01', origin='2031-01-01T01:00:00Z',
                    probability=np.array([[.2, .9]] * 6), truth=np.array([[True, False]] * 6),
@@ -135,6 +114,32 @@ class Task123ColabTests(unittest.TestCase):
             [row], dict(thresholds={'onset': .5}, force_nonempty=True))
         self.assertEqual(metrics['proxy_IoU'], 0.)
         self.assertFalse(details.empty_before.iloc[0])
+
+
+class Task123ColabTests(QueueNotebookRegressions, unittest.TestCase):
+    notebook = NOTEBOOK
+
+    def test_interrupted_restore_can_retry_without_partial_reports(self):
+        namespace = functions(tagged('environment'), ['restore_reports'],
+                              dict(Path=Path, shutil=shutil, tempfile=tempfile))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, target = root / 'previous/reports', root / 'current/reports'
+            source.mkdir(parents=True)
+            (source / 'model.pt').write_bytes(b'complete checkpoint')
+
+            def interrupt(previous, pending, **kwargs):
+                (pending / 'model.pt').write_bytes(b'partial')
+                raise InterruptedError('interrupted copy')
+
+            with patch.object(shutil, 'copytree', side_effect=interrupt):
+                with self.assertRaises(InterruptedError):
+                    namespace['restore_reports'](source, target)
+            self.assertFalse(target.exists())
+            namespace['restore_reports'](source, target)
+            self.assertEqual((target / 'model.pt').read_bytes(), b'complete checkpoint')
+            with self.assertRaises(FileExistsError):
+                namespace['restore_reports'](source, target)
 
     def test_gradient_probe_does_not_accumulate_parameter_gradients(self):
         import torch
@@ -149,6 +154,10 @@ class Task123ColabTests(unittest.TestCase):
         self.assertAlmostEqual(result['weighted_grad_physics'], .175, places=6)
         (losses['State'] + .5 * (.05 * losses['N'] + .2 * losses['dN'])).backward()
         self.assertAlmostEqual(float(parameter.grad[0]), 4.175, places=5)
+
+
+class Task123KaggleTests(QueueNotebookRegressions, unittest.TestCase):
+    notebook = KAGGLE_NOTEBOOK
 
 
 if __name__ == '__main__':
