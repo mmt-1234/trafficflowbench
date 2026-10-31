@@ -358,7 +358,9 @@ class Task123KaggleTests(Task123NotebookRegressions, unittest.TestCase):
             previous, current = root / 'previous', root / 'current'
             dates = dict(fit=['2030-06-01'], early=['2031-01-01'], blend=['2031-01-19'])
             panel = SimpleNamespace(name='P_N', links=['l0'])
-            targets = SimpleNamespace(stations=['s0'], links=['l0'])
+            targets = SimpleNamespace(stations=['s0'], links=['l0'],
+                archive={date: np.array([0]) for days in dates.values() for date in days},
+                regimes={date: 'R1' for days in dates.values() for date in days})
             profile = np.ones((2016, 1, 3), np.float32)
             packed = dict(network={'links': panel.links}, stations=targets.stations,
                           station_links=targets.links, dates=dates, profile=torch.from_numpy(profile),
@@ -367,7 +369,12 @@ class Task123KaggleTests(Task123NotebookRegressions, unittest.TestCase):
             for period, days in dates.items():
                 path = previous / 'inputs' / packed['cache_key'] / 'P_N' / period / f'{days[0]}.npz'
                 path.parent.mkdir(parents=True)
-                np.savez_compressed(path, target=np.ones((1, 1), bool))
+                np.savez_compressed(path, values=np.ones((1, 1, 3)), visible=np.ones((1, 1, 3), bool),
+                    aux=np.ones((1, 1, 21), np.float32), slot=np.array([0]), weekday=np.array([0]),
+                    base=np.ones((1, 1, 2)), truth=np.ones((1, 1, 2)), target=np.ones((1, 1), bool),
+                    active=np.ones((1, 1), bool), observed=np.ones((1, 1, 2)),
+                    timestamps=np.array([f'{days[0]}T00:00:00Z']), ti=np.array([0]), si=np.array([0]),
+                    regime=np.array(0), ramp_valid=np.ones((1, 1), bool), consecutive=np.zeros(0, bool))
                 entries.append(dict(panel='P_N', period=period, date=days[0], path=str(path)))
             settings = dict(release='old-location', architecture='maginet-task13-residual-v2',
                             aux_names=['quality'], output_scale=[25., 600.],
@@ -376,18 +383,18 @@ class Task123KaggleTests(Task123NotebookRegressions, unittest.TestCase):
             namespace = dict(np=np, json=json, hashlib=hashlib, torch=torch, re=re, zipfile=zipfile,
                              CACHE_CHECKPOINT=None, CACHE_SOURCE_DIR=previous, CACHE_MODE='reuse',
                              AUX_NAMES=('quality',), SCALE=np.array([25., 600.]),
+                             REGIMES=('R1', 'R2', 'R3'),
                              BATCH_POLICY='fixed', PANEL_BATCH={}, DAYS_PER_REGIME=None,
                              notebook_signature=lambda *a: (None, {**settings}),
                              network_hashes=lambda *a: {'P_N': 'same-network'},
                              TRAIN_MODEL=False, MASK_RESAMPLE=False,
                              time=SimpleNamespace(perf_counter=lambda: 0.),
-                             validate_cache_targets=lambda *a: (0, 1),
                              day_source_signature=lambda *a: self.fail('Legacy reuse must not rescan raw days'),
                              fit_prior=lambda *a: self.fail('Stored profile must not be recomputed'),
                              make_day=lambda *a: self.fail('Stored NPZ must not be regenerated'))
             functions(embedded('maginet', self.notebook),
                       ['load_cache_checkpoint', 'checkpoint_fit_profile', 'load_fit_profile',
-                       'cache_context', 'cache_is_current', 'run_signature'], namespace)
+                       'cache_context', 'cache_is_current', 'run_signature', 'validate_cache_targets'], namespace)
             signature, saved_settings = namespace['run_signature']({}, entries, {})
             checkpoint = root / 'best_maginet.pt'
             payload = dict(format_version=3, settings=saved_settings, signature=signature, contexts={'P_N': packed})
@@ -396,12 +403,32 @@ class Task123KaggleTests(Task123NotebookRegressions, unittest.TestCase):
             namespace['CACHE_CHECKPOINT'] = namespace['load_cache_checkpoint'](checkpoint, previous)
             np.testing.assert_array_equal(namespace['load_fit_profile'](panel, targets, dates['fit'], {}), profile)
             # A new panel subset may generate a different destination key; the saved key still locates old NPZs.
-            context = dict(panel=panel, targets=targets, dates=dates, profile=profile, cache_key='new-key')
-            reused = namespace['cache_context'](context, current)
+            context = dict(panel=panel, targets=targets, dates=dates, profile=profile,
+                           mapping=np.array([0]), cache_key='new-key')
+            with np.load(entries[0]['path'], allow_pickle=False) as data:
+                archive_type = type(data)
+            read_array, reads = archive_type.__getitem__, []
+            def tracked_read(archive, key):
+                reads.append(key)
+                return read_array(archive, key)
+            with patch.object(archive_type, '__getitem__', tracked_read):
+                reused = namespace['cache_context'](context, current)
+            self.assertIn('target', reads)
+            self.assertNotIn('aux', reads)
+            self.assertNotIn('weekday', reads)
+            self.assertNotIn('values', reads)
             self.assertEqual([e['path'] for e in reused], [e['path'] for e in entries])
             self.assertEqual(before, {p: p.read_bytes() for p in previous.rglob('*') if p.is_file()})
             self.assertFalse(list(current.rglob('*.npz')))
             self.assertFalse(list(current.rglob('*.npy')))
+            # Without the verified-snapshot fast path, the full profile check remains required.
+            with np.load(entries[0]['path'], allow_pickle=False) as data:
+                with self.assertRaisesRegex(ValueError, '과거 평균 특징'):
+                    namespace['validate_cache_targets'](data, {**context, 'profile': profile * 2}, dates['fit'][0])
+            targets.archive[dates['fit'][0]] = np.array([1])
+            with self.assertRaisesRegex(ValueError, '대상 셀'):
+                namespace['cache_context'](context, current)
+            targets.archive[dates['fit'][0]] = np.array([0])
             with self.assertRaisesRegex(ValueError, 'fit 날짜'):
                 namespace['load_fit_profile'](panel, targets, ['2030-06-02'], {})
             bad_profile = namespace['CACHE_CHECKPOINT']['contexts']['P_N']['profile']
