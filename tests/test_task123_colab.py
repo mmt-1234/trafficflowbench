@@ -47,6 +47,51 @@ class Task123NotebookRegressions:
                                      notebook['metadata']['trafficflow']['source_sha256'][name])
                     compile(ast.parse(source), name, 'exec')
 
+    def test_notebook_has_only_train_and_predict_modes(self):
+        notebook = json.loads(self.notebook.read_text())
+        self.assertNotIn('smoke', ''.join(''.join(cell['source']) for cell in notebook['cells']).lower())
+        namespace = {}
+        exec(tagged('configuration', self.notebook), namespace)
+        self.assertEqual(namespace['RUN_MODE'], 'train')
+        self.assertIn('--queue-balanced', namespace['QUEUE_FLAGS'])
+        validation = next(node for node in ast.parse(tagged('environment', self.notebook)).body
+                          if isinstance(node, ast.If) and ast.unparse(node.test).startswith('RUN_MODE not in'))
+        validation = compile(ast.Module(body=[validation], type_ignores=[]), '<mode-validation>', 'exec')
+        for mode in ('train', 'predict'):
+            exec(validation, {'RUN_MODE': mode})
+        with self.assertRaises(ValueError):
+            exec(validation, {'RUN_MODE': 'smoke'})
+
+    def test_train_cells_preserve_configured_budgets_and_queue_initialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            namespace = {}
+            exec(tagged('configuration', self.notebook), namespace)
+            calls = {}
+            def record(task, arguments):
+                calls[task] = arguments
+                checkpoint = namespace['QUEUE_CHECKPOINT' if task == 'queue' else 'MAGINET_CHECKPOINT']
+                checkpoint.parent.mkdir(parents=True, exist_ok=True)
+                checkpoint.write_bytes(b'test checkpoint')
+            namespace.update(RELEASE=root / 'release', CACHE_DIR=root / 'cache', MAGINET_DIR=root / 'state',
+                             QUEUE_CHECKPOINT=root / 'queue/queue.pt', QUEUE_INIT_CHECKPOINT=root / 'old/queue.pt',
+                             EFFECTIVE_BACKEND='scan', QUEUE_PRECISION='fp32', QUEUE_EPOCHS=3, MAGINET_EPOCHS=4,
+                             queue_eval_args=['--validation-windows', '5'], panel_args=[],
+                             training_action=lambda *args: 'new',
+                             call_queue=lambda args: record('queue', args),
+                             call_maginet=lambda args: record('state', args))
+            for tag in ('train-state', 'train-queue'):
+                exec(tagged(tag, self.notebook), namespace)
+            for task, budget in (('queue', 3), ('state', 4)):
+                arguments = calls[task]
+                self.assertEqual(arguments[arguments.index('--epochs') + 1], budget)
+                self.assertNotIn('--max-days', arguments)
+                self.assertNotIn('--days-per-regime', arguments)
+                self.assertNotIn('--width', arguments)
+            self.assertIn('--queue-balanced', calls['queue'])
+            self.assertIn('--queue-public-contract', calls['queue'])
+            self.assertEqual(calls['queue'][calls['queue'].index('--init-queue') + 1], root / 'old/queue.pt')
+
     def test_nonempty_adds_only_one_target_and_keeps_existing_positives(self):
         decide = functions(embedded('learning', self.notebook), ['queue_decisions'], {'np': np})['queue_decisions']
         probability = np.array([[.1, .4], [.3, .99]])
@@ -86,7 +131,7 @@ class Task123NotebookRegressions:
                          aggregate_channels=lambda *a: (np.zeros((count, 3, 3)), None, None),
                          ramp_features=lambda *a: np.zeros((count, 3, 4)),
                          slice_day=lambda *a: None, queue_features=lambda *a: np.zeros((12, 3, 44)))
-        functions(embedded('learning', self.notebook), ['queue_examples', 'stable_seed', 'iou'], namespace)
+        functions(embedded('learning', self.notebook), ['queue_examples', 'choose_queue_origins', 'stable_seed', 'iou'], namespace)
         context = dict(panel=panel, release=Path('/unused'), profile=None)
         samples = namespace['queue_examples'](context, Path('states_2031-01-01.parquet'), args, 'select')
         self.assertTrue(samples)
@@ -123,7 +168,7 @@ class Task123NotebookRegressions:
                          aggregate_channels=lambda *a: (np.zeros((count, 3, 3)), None, None),
                          ramp_features=lambda *a: np.zeros((count, 3, 4)),
                          slice_day=lambda *a: None, queue_features=lambda *a: np.zeros((12, 3, 44)))
-        functions(embedded('learning', self.notebook), ['queue_examples', 'stable_seed', 'iou'], namespace)
+        functions(embedded('learning', self.notebook), ['queue_examples', 'choose_queue_origins', 'stable_seed', 'iou'], namespace)
         context = dict(panel=panel, release=Path('/unused'), profile=None, queue_target_nodes=np.array([0]))
         path = Path('states_2031-01-01.parquet')
         samples = namespace['queue_examples'](context, path, args, 'fit')
@@ -161,19 +206,54 @@ class Task123NotebookRegressions:
         self.assertEqual(metrics['proxy_IoU'], 0.)
         self.assertFalse(details.empty_before.iloc[0])
 
-    def test_gradient_probe_does_not_accumulate_parameter_gradients(self):
-        import torch
-        namespace = dict(torch=torch, np=np, LOSS_WEIGHTS={'N': .05, 'dN': .2})
-        probe = functions(embedded('maginet', self.notebook), ['loss_gradient_diagnostics'], namespace)['loss_gradient_diagnostics']
-        parameter = torch.tensor([2.], requires_grad=True)
-        losses = dict(State=parameter.square().sum(), N=-parameter.sum(), dN=2 * parameter.sum())
-        result = probe(losses, [parameter], .5)
-        self.assertIsNone(parameter.grad)
-        self.assertAlmostEqual(result['cos_State_N'], -1.)
-        self.assertAlmostEqual(result['cos_State_dN'], 1.)
-        self.assertAlmostEqual(result['weighted_grad_physics'], .175, places=6)
-        (losses['State'] + .5 * (.05 * losses['N'] + .2 * losses['dN'])).backward()
-        self.assertAlmostEqual(float(parameter.grad[0]), 4.175, places=5)
+    def test_current003_is_fixed_without_weight_or_gradient_options(self):
+        namespace = {}
+        exec(tagged('configuration', self.notebook), namespace)
+        self.assertNotIn('PHYSICS_PRESET', namespace)
+        self.assertNotIn('PHYSICS_PRESETS', namespace)
+        self.assertNotIn('GRADIENT_EVERY', namespace)
+        code = embedded('maginet', self.notebook)
+        assignment = next(node for node in ast.parse(code).body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == 'LOSS_WEIGHTS' for target in node.targets))
+        values = {}
+        exec(compile(ast.Module(body=[assignment], type_ignores=[]), '<physics-weights>', 'exec'), values)
+        self.assertEqual(values['LOSS_WEIGHTS'], dict(N=.05, dN=.03, FD=0.))
+        for removed in ('--n-weight', '--dn-weight', '--gradient-every', 'loss_gradient_diagnostics'):
+            self.assertNotIn(removed, code)
+        self.assertIn('-current003', tagged('environment', self.notebook))
+
+    def test_obsolete_comparisons_and_fast_state_pipeline_are_removed(self):
+        namespace = {}
+        exec(tagged('configuration', self.notebook), namespace)
+        self.assertNotIn('QUEUE_REFERENCE_SUBMISSION', namespace)
+        self.assertNotIn('--experiment', tagged('train-state', self.notebook))
+        definitions = {}
+        for name in ('data', 'fast_model', 'learning', 'run', 'maginet'):
+            definitions[name] = {node.name for node in ast.parse(embedded(name, self.notebook)).body
+                                 if isinstance(node, (ast.ClassDef, ast.FunctionDef))}
+        self.assertTrue({'train_files', 'day_masks', 'queue_windows', 'mean_iou', 'fit_state',
+                         'predict_state', 'make_submission'}.isdisjoint(definitions['run']))
+        self.assertTrue({'StateModel', 'TrafficStateModel', 'FASTEncoder'}.isdisjoint(definitions['fast_model']))
+        self.assertTrue({'state_examples', 'state_loss', 'state_metrics', 'predict_state_v2'}.isdisjoint(definitions['learning']))
+        self.assertTrue({'EXPERIMENTS', 'LearnedSpatialConv', 'resample_fit_mask'}.isdisjoint(definitions['maginet']))
+        self.assertNotIn('load_best_maginet', definitions['maginet'])
+        self.assertNotIn('AdaptiveGraphResidual', definitions['fast_model'])
+        self.assertIn('WaveletResidual', definitions['fast_model'])
+        self.assertIn('TrafficQueueModel', definitions['fast_model'])
+        self.assertIn('queue_examples', definitions['learning'])
+        code = embedded('maginet', self.notebook)
+        for node in ast.walk(ast.parse(code)):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'save_checkpoint':
+                self.assertNotIn('best_state_maginet.pt', ast.unparse(node))
+
+    def test_checkpoint_restore_accepts_only_the_current_maginet_architecture(self):
+        restore = functions(embedded('maginet', self.notebook), ['restore_settings'], {'SETTING_NAMES': {}})['restore_settings']
+        improvements = dict(temporal_direct=True, learned_graph=True, mask_resample=None, spatial_mode='channel')
+        restore(dict(architecture='maginet-task13-residual-v2', improvements=improvements))
+        for change in (dict(temporal_direct=False), dict(learned_graph=False),
+                       dict(mask_resample='fit-link-v2'), dict(spatial_mode='legacy'), dict(spatial_mode='context')):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'channel_graph'):
+                restore(dict(architecture='maginet-task13-residual-v2', improvements={**improvements, **change}))
 
 
 class Task123ColabTests(Task123NotebookRegressions, unittest.TestCase):
@@ -227,7 +307,7 @@ class Task123KaggleTests(Task123NotebookRegressions, unittest.TestCase):
             namespace = dict(np=np, json=json, hashlib=hashlib, shutil=shutil,
                              CACHE_METADATA_DIR=current / 'metadata', CACHE_ROOT=current,
                              CACHE_CONTAINER=current, CACHE_PROFILE_DIR=current / 'legacy_profiles',
-                             CACHE_SOURCE_DIR=previous, CACHE_MODE='reuse', AUX_NAMES=('quality',),
+                             CACHE_SOURCE_DIR=previous, CACHE_CHECKPOINT=None, CACHE_MODE='reuse', AUX_NAMES=('quality',),
                              SCALE=np.array([25., 600.]), profile_source_signature=lambda *a: 'same-input',
                              fit_prior=lambda *a: self.fail('Previous profile must not be recomputed'))
             functions(embedded('maginet', self.notebook), ['load_fit_profile', 'cache_is_current'], namespace)
@@ -253,7 +333,7 @@ class Task123KaggleTests(Task123NotebookRegressions, unittest.TestCase):
             marker = path.with_suffix('.sources.json')
             marker.write_text(json.dumps('same-input'))
             before = path.read_bytes()
-            namespace = dict(np=np, json=json, CACHE_SOURCE_DIR=previous, CACHE_MODE='reuse',
+            namespace = dict(np=np, json=json, CACHE_SOURCE_DIR=previous, CACHE_CHECKPOINT=None, CACHE_MODE='reuse',
                              TRAIN_MODEL=False, MASK_RESAMPLE=False,
                              time=SimpleNamespace(perf_counter=lambda: 0.),
                              day_source_signature=lambda *a: 'same-input',
@@ -268,6 +348,88 @@ class Task123KaggleTests(Task123NotebookRegressions, unittest.TestCase):
             marker.unlink()
             with self.assertRaisesRegex(FileNotFoundError, '출처'):
                 namespace['cache_context'](context, current, periods=('fit',))
+
+    def test_legacy_native_cache_recovers_profile_and_verifies_checkpoint_input_hash(self):
+        import re
+        import torch
+        import zipfile
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous, current = root / 'previous', root / 'current'
+            dates = dict(fit=['2030-06-01'], early=['2031-01-01'], blend=['2031-01-19'])
+            panel = SimpleNamespace(name='P_N', links=['l0'])
+            targets = SimpleNamespace(stations=['s0'], links=['l0'])
+            profile = np.ones((2016, 1, 3), np.float32)
+            packed = dict(network={'links': panel.links}, stations=targets.stations,
+                          station_links=targets.links, dates=dates, profile=torch.from_numpy(profile),
+                          cache_key='2b519739ec38ca9ff744')
+            entries = []
+            for period, days in dates.items():
+                path = previous / 'inputs' / packed['cache_key'] / 'P_N' / period / f'{days[0]}.npz'
+                path.parent.mkdir(parents=True)
+                np.savez_compressed(path, target=np.ones((1, 1), bool))
+                entries.append(dict(panel='P_N', period=period, date=days[0], path=str(path)))
+            settings = dict(release='old-location', architecture='maginet-task13-residual-v2',
+                            aux_names=['quality'], output_scale=[25., 600.],
+                            panels={'P_N': dict(stations=targets.stations, links=targets.links, dates=dates,
+                                               profile_hash=hashlib.sha256(profile.tobytes()).hexdigest())})
+            namespace = dict(np=np, json=json, hashlib=hashlib, torch=torch, re=re, zipfile=zipfile,
+                             CACHE_CHECKPOINT=None, CACHE_SOURCE_DIR=previous, CACHE_MODE='reuse',
+                             AUX_NAMES=('quality',), SCALE=np.array([25., 600.]),
+                             BATCH_POLICY='fixed', PANEL_BATCH={}, DAYS_PER_REGIME=None,
+                             notebook_signature=lambda *a: (None, {**settings}),
+                             network_hashes=lambda *a: {'P_N': 'same-network'},
+                             TRAIN_MODEL=False, MASK_RESAMPLE=False,
+                             time=SimpleNamespace(perf_counter=lambda: 0.),
+                             validate_cache_targets=lambda *a: (0, 1),
+                             day_source_signature=lambda *a: self.fail('Legacy reuse must not rescan raw days'),
+                             fit_prior=lambda *a: self.fail('Stored profile must not be recomputed'),
+                             make_day=lambda *a: self.fail('Stored NPZ must not be regenerated'))
+            functions(embedded('maginet', self.notebook),
+                      ['load_cache_checkpoint', 'checkpoint_fit_profile', 'load_fit_profile',
+                       'cache_context', 'cache_is_current', 'run_signature'], namespace)
+            signature, saved_settings = namespace['run_signature']({}, entries, {})
+            checkpoint = root / 'best_maginet.pt'
+            payload = dict(format_version=3, settings=saved_settings, signature=signature, contexts={'P_N': packed})
+            torch.save(payload, checkpoint)
+            before = {p: p.read_bytes() for p in previous.rglob('*') if p.is_file()}
+            namespace['CACHE_CHECKPOINT'] = namespace['load_cache_checkpoint'](checkpoint, previous)
+            np.testing.assert_array_equal(namespace['load_fit_profile'](panel, targets, dates['fit'], {}), profile)
+            # A new panel subset may generate a different destination key; the saved key still locates old NPZs.
+            context = dict(panel=panel, targets=targets, dates=dates, profile=profile, cache_key='new-key')
+            reused = namespace['cache_context'](context, current)
+            self.assertEqual([e['path'] for e in reused], [e['path'] for e in entries])
+            self.assertEqual(before, {p: p.read_bytes() for p in previous.rglob('*') if p.is_file()})
+            self.assertFalse(list(current.rglob('*.npz')))
+            self.assertFalse(list(current.rglob('*.npy')))
+            with self.assertRaisesRegex(ValueError, 'fit 날짜'):
+                namespace['load_fit_profile'](panel, targets, ['2030-06-02'], {})
+            bad_profile = namespace['CACHE_CHECKPOINT']['contexts']['P_N']['profile']
+            bad_profile[0, 0, 0] = float('nan')
+            with self.assertRaisesRegex(ValueError, '과거 평균'):
+                namespace['load_fit_profile'](panel, targets, dates['fit'], {})
+            bad_profile[0, 0, 0] = 1.
+            namespace['network_hashes'] = lambda *a: {'P_N': 'different-network'}
+            with self.assertRaisesRegex(ValueError, '도로 구성'):
+                namespace['cache_context'](context, current)
+            namespace['network_hashes'] = lambda *a: {'P_N': 'same-network'}
+            # Template validation must still reject an incompatible cache after snapshot verification.
+            def reject_targets(*args):
+                raise ValueError('잘못된 템플릿')
+            namespace['validate_cache_targets'] = reject_targets
+            with self.assertRaisesRegex(ValueError, '템플릿'):
+                namespace['cache_context'](context, current)
+            path = Path(entries[0]['path'])
+            np.savez_compressed(path, target=np.zeros((1, 1), bool))
+            with self.assertRaisesRegex(ValueError, '입력 hash'):
+                namespace['load_cache_checkpoint'](checkpoint, previous)
+            path.unlink()
+            with self.assertRaisesRegex(FileNotFoundError, '입력 캐시'):
+                namespace['load_cache_checkpoint'](checkpoint, previous)
+            payload['signature'] = 'invalid'
+            torch.save(payload, checkpoint)
+            with self.assertRaisesRegex(ValueError, '설정 서명'):
+                namespace['load_cache_checkpoint'](checkpoint, previous)
 
 
 if __name__ == '__main__':

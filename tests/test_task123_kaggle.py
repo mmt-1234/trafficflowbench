@@ -104,6 +104,22 @@ def release_fixture(root):
     return key
 
 
+def tiny_training(namespace):
+    """Use normal train commands with explicit small CPU fixture settings."""
+    queue, state = namespace['call_queue'], namespace['call_maginet']
+    def call_queue(arguments):
+        if arguments[0] == 'train-queue':
+            arguments = [*arguments, '--max-days', 2, '--width', 8, '--heads', 2, '--blocks', 1,
+                         '--batch-size', 2, '--windows-per-day', 1, '--normal-windows', 1]
+        queue(arguments)
+    def call_state(arguments):
+        if arguments[0] == 'train':
+            arguments = [*arguments, '--days-per-regime', 1, '--updates-per-group', 1,
+                         '--width', 8, '--heads', 2, '--blocks', 1]
+        state(arguments)
+    namespace.update(call_queue=call_queue, call_maginet=call_state)
+
+
 class Task123Notebook(unittest.TestCase):
     def test_embedded_sources_are_pinned_and_all_cells_parse(self):
         nb = notebook()
@@ -166,16 +182,30 @@ class Task123Notebook(unittest.TestCase):
             release_fixture(release)
             ns = {"display": lambda value: None}
             exec(tagged("configuration"), ns)
-            ns.update(RELEASE_ROOT=str(release), WORK_ROOT=root / "working/trafficflow_task123", TASK1_CACHE_ROOT=None,
-                      INSTALL_MISSING_PACKAGES=False, CPU_THREADS=1, USE_RETRIEVAL=False, RESUME=True)
+            ns.update(RELEASE_ROOT=str(release), WORK_ROOT=root / "working/trafficflow_task123", TASK1_CACHE_ROOT=None, TASK1_CACHE_CHECKPOINT=None,
+                      INSTALL_MISSING_PACKAGES=False, CPU_THREADS=1, USE_RETRIEVAL=False, RESUME=True,
+                      QUEUE_BACKEND='scan', MAGINET_EPOCHS=2, QUEUE_EPOCHS=2, VALIDATION_WINDOWS=2)
             with patch("torch.cuda.is_available", return_value=False), contextlib.redirect_stdout(io.StringIO()):
                 for cell in notebook()["cells"]:
                     tags = cell.get("metadata", {}).get("tags", [])
                     if cell["cell_type"] == "code" and ("embedded-source" in tags or
                             any(tag in tags for tag in ("environment", "module-loader", "backend-check", "train-state"))):
                         exec(source(cell), ns)
+                        if 'backend-check' in tags:
+                            tiny_training(ns)
                 paths = [ns["MAGINET_CHECKPOINT"], ns["MAGINET_DIR"] / "full/last_maginet.pt"]
                 before = [path.read_bytes() for path in paths]
+                self.assertFalse((paths[0].parent / 'best_state_maginet.pt').exists())
+                saved_state = torch.load(paths[1], map_location='cpu', weights_only=True)
+                self.assertEqual(saved_state['settings']['loss_weights'], dict(N=.05, dN=.03, FD=0.))
+                # A former alternative loss can still be loaded for prediction, but cannot resume as current003.
+                other = root / 'other-loss/full'
+                other.mkdir(parents=True)
+                saved_state['settings']['loss_weights']['dN'] = .2
+                torch.save(saved_state, other / 'last_maginet.pt')
+                with self.assertRaisesRegex(ValueError, 'current003'):
+                    ns['call_maginet'](['train', '--release-root', ns['RELEASE'], '--cache-dir', ns['CACHE_DIR'],
+                                        '--output-dir', other.parent, '--resume', '--epochs', 3, '--device', 'cpu'])
                 self.assertFalse(ns["QUEUE_CHECKPOINT"].exists())
                 # A complete State must be reused while an unstarted Queue begins from scratch.
                 exec(tagged("train-state"), ns)
@@ -208,18 +238,22 @@ class Task123Notebook(unittest.TestCase):
                       for p in release.rglob("*") if p.is_file()}
             ns = {"display": lambda value: None}
             exec(compile(tagged("configuration"), "configuration", "exec"), ns)
-            ns.update(RELEASE_ROOT=str(release), WORK_ROOT=root / "working/trafficflow_task123", TASK1_CACHE_ROOT=None,
-                      INSTALL_MISSING_PACKAGES=False, CPU_THREADS=1, RUN_FEBRUARY=True)
+            ns.update(RELEASE_ROOT=str(release), WORK_ROOT=root / "working/trafficflow_task123", TASK1_CACHE_ROOT=None, TASK1_CACHE_CHECKPOINT=None,
+                      INSTALL_MISSING_PACKAGES=False, CPU_THREADS=1, RUN_FEBRUARY=True, USE_RETRIEVAL=True,
+                      QUEUE_BACKEND='scan', MAGINET_EPOCHS=2, QUEUE_EPOCHS=2, VALIDATION_WINDOWS=2,
+                      MAKE_SUBMISSION=False)
             log = io.StringIO()
             with patch("torch.cuda.is_available", return_value=False), contextlib.redirect_stdout(log):
                 for cell in notebook()["cells"]:
                     tags = cell.get("metadata", {}).get("tags", [])
                     if cell["cell_type"] == "code" and "configuration" not in tags:
                         exec(compile(source(cell), str(tags), "exec"), ns)
+                        if 'backend-check' in tags:
+                            tiny_training(ns)
                 self.assertTrue((ns["RELEASE"].parent / "processed_v2").is_dir())
                 self.assertFalse((release.parent / "processed_v2").exists())
                 self.assertTrue((ns["MAGINET_DIR"] / "retrieval/selected_retrieval.json").is_file())
-                self.assertTrue((ns["QUEUE_DIR"] / "february.json").is_file())
+                self.assertTrue((ns["QUEUE_DIR"] / "calibration-public-v1/february_fixed.json").is_file())
                 self.assertFalse(ns["SUBMISSION_PATH"].exists())
                 for path in ns["STATE_FILES"] + ns["QUEUE_FILES"]:
                     frame = pd.read_csv(path, dtype=str)
@@ -228,11 +262,13 @@ class Task123Notebook(unittest.TestCase):
                         self.assertTrue(pd.to_numeric(frame.queue_pred).isin([0, 1]).all())
                 saved = torch.load(ns["QUEUE_CHECKPOINT"], map_location="cpu", weights_only=True)
                 self.assertEqual(len(saved["feature_names"]), 44)
-                self.assertEqual(saved["model_config"]["queue_head"], "pooled-mlp")
+                self.assertEqual(saved["model_config"]["queue_head"], "conditional")
+                self.assertTrue(saved["model_config"]["queue_future_prior"])
+                self.assertEqual(saved["training_args"]["queue_label_mode"], "sample")
                 self.assertTrue(saved["training_args"]["queue_origin"])
 
                 # Same notebook cells resume both models, then generate fresh outputs.
-                ns.update(RESUME=True, SMOKE_EPOCHS=3)
+                ns.update(RESUME=True, MAGINET_EPOCHS=3, QUEUE_EPOCHS=3)
                 for tag in ("train-state", "train-queue", "evaluate", "predict"):
                     exec(compile(tagged(tag), tag, "exec"), ns)
                 for path in (ns["MAGINET_DIR"] / "full/last_maginet.pt", ns["QUEUE_DIR"] / "queue.last.pt"):
@@ -274,7 +310,7 @@ class Task123Notebook(unittest.TestCase):
                     ns["merge_submission"](files, release / "submission_key.csv", output)
                 queue.to_csv(qpath, index=False)
                 # Full-coverage notebook integration uses the provided Task 4 CSVs.
-                ns.update(RUN_MODE="predict", TASK4_FILES=odme_files)
+                ns.update(RUN_MODE="predict", TASK4_FILES=odme_files, MAKE_SUBMISSION=True)
                 exec(compile(tagged("merge"), "merge", "exec"), ns)
                 self.assertEqual(len(pd.read_csv(output)), len(key))
 
@@ -284,9 +320,9 @@ class Task123Notebook(unittest.TestCase):
                 restored = {"display": lambda value: None}
                 exec(compile(tagged("configuration"), "configuration", "exec"), restored)
                 restored.update(RUN_MODE="predict", RELEASE_ROOT=str(release), WORK_ROOT=root / "restored/trafficflow_task123",
-                                RESTORE_ROOT=previous, QUEUE_BACKEND="scan", TASK4_FILES=odme_files, TASK1_CACHE_ROOT=None,
-                                INSTALL_MISSING_PACKAGES=False, CPU_THREADS=1)
-                selection = previous / "reports/full/maginet" / ns["MAGINET_EXPERIMENT"] / "retrieval/selected_retrieval.json"
+                                RESTORE_ROOT=previous, QUEUE_BACKEND="scan", TASK4_FILES=odme_files, TASK1_CACHE_ROOT=None, TASK1_CACHE_CHECKPOINT=None,
+                                INSTALL_MISSING_PACKAGES=False, CPU_THREADS=1, CALIBRATE_QUEUE=False)
+                selection = previous / 'reports/full' / ns['MAGINET_DIR'].relative_to(ns['RESULTS']) / 'retrieval/selected_retrieval.json'
                 selected_before = selection.read_bytes()
                 for cell in notebook()["cells"]:
                     tags = cell.get("metadata", {}).get("tags", [])
@@ -306,8 +342,8 @@ class Task123Notebook(unittest.TestCase):
                 portable = {"display": lambda value: None}
                 exec(tagged("configuration"), portable)
                 portable.update(RUN_MODE="predict", RELEASE_ROOT=str(inference), WORK_ROOT=root / "portable/trafficflow_task123",
-                                RESTORE_ROOT=previous, QUEUE_BACKEND="scan", TASK4_FILES=odme_files, TASK1_CACHE_ROOT=None,
-                                INSTALL_MISSING_PACKAGES=False, CPU_THREADS=1, USE_RETRIEVAL=False)
+                                RESTORE_ROOT=previous, QUEUE_BACKEND="scan", TASK4_FILES=odme_files, TASK1_CACHE_ROOT=None, TASK1_CACHE_CHECKPOINT=None,
+                                INSTALL_MISSING_PACKAGES=False, CPU_THREADS=1, USE_RETRIEVAL=False, CALIBRATE_QUEUE=False)
                 for cell in notebook()["cells"]:
                     if cell["cell_type"] == "code" and "configuration" not in cell.get("metadata", {}).get("tags", []):
                         exec(source(cell), portable)
