@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -16,8 +17,8 @@ from torch import nn
 NOTEBOOK = Path(__file__).resolve().parents[1] / 'notebooks/task123_colab.ipynb'
 
 
-def embedded(name):
-    notebook = json.loads(NOTEBOOK.read_text())
+def embedded(name, path=NOTEBOOK):
+    notebook = json.loads(path.read_text())
     cell = next(c for c in notebook['cells'] if name in c.get('metadata', {}).get('tags', []))
     return ast.literal_eval(ast.parse(''.join(cell['source'])).body[0].value.args[1])
 
@@ -64,13 +65,15 @@ def statistics(width, bounds=(.1, .2), variance=(.01, .04), n_bound=.2, n_varian
 
 
 class PhysicsCorrectorTests(unittest.TestCase):
+    notebook = NOTEBOOK
+
     @classmethod
     def setUpClass(cls):
-        helpers = definitions(embedded('maginet'), dict(np=np, pd=pd),
+        helpers = definitions(embedded('maginet', cls.notebook), dict(np=np, pd=pd),
                               {'link_mean_numpy', 'consecutive_five_minutes', 'final_state_output'})
         cls.m = SimpleNamespace(**{name: helpers[name] for name in
                                   ('link_mean_numpy', 'consecutive_five_minutes', 'final_state_output')})
-        cls.code = definitions(embedded('physics_corrector'),
+        cls.code = definitions(embedded('physics_corrector', cls.notebook),
                                dict(np=np, pd=pd, torch=torch, nn=nn, m=cls.m, Path=Path,
                                     json=json, hashlib=hashlib))
 
@@ -225,7 +228,7 @@ class PhysicsCorrectorTests(unittest.TestCase):
     def test_training_uses_final_state_and_count_losses_then_reloads(self):
         names = {'link_mean_numpy', 'consecutive_five_minutes', 'observability_mask', 'completed_link_fields',
                  'training_transitions', 'joint_loss', 'physics_totals', 'state_totals', 'summarize', 'macro_mean'}
-        namespace = definitions(embedded('maginet'), dict(np=np, pd=pd, torch=torch,
+        namespace = definitions(embedded('maginet', self.notebook), dict(np=np, pd=pd, torch=torch,
             LOSS_WEIGHTS=dict(N=.05, dN=.03, FD=0.), SCALE=np.array([25., 600.]),
             SELECT_WEIGHTS=dict(State=.7, FD_proxy=.1, LWR_proxy=.2)), names)
         physical = SimpleNamespace(**{name: namespace[name] for name in names}, DEVICE=torch.device('cpu'),
@@ -351,6 +354,72 @@ class PhysicsCorrectorTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate([dict(period=period, date='2031-02-01')], period)
         validate([dict(period='fit', date='2030-12-31')], 'fit')
+
+
+class KagglePhysicsCorrectorTests(PhysicsCorrectorTests):
+    notebook = NOTEBOOK.with_name('task123_kaggle.ipynb')
+
+    def test_selected_correction_reaches_both_submission_splits_after_blend(self):
+        callbacks = {'P_N': object()}
+        base_model, contexts, tensors = object(), {'P_N': {}}, {'P_N': {}}
+        cache = SimpleNamespace(alpha=.25)
+        predict = Mock(side_effect=lambda *args, **kwargs: [f'{args[4]}.csv'])
+        load = Mock(return_value=({}, base_model, contexts, tensors, cache, callbacks))
+        with patch.dict(self.code, m=SimpleNamespace(predict_split=predict), load_selection=load):
+            paths = self.code['predict_selected']('selection.json', 'base.pt', 'release', 'cache')
+        self.assertEqual(paths, [Path('validation.csv'), Path('private.csv')])
+        self.assertEqual(predict.call_count, 2)
+        for call in predict.call_args_list:
+            self.assertEqual(call.args[:4], (contexts, base_model, tensors, .25))
+            self.assertEqual(call.kwargs, dict(finalprocessors=callbacks))
+
+    def test_notebook_correction_preserves_kaggle_cache_policy(self):
+        notebook = json.loads(self.notebook.read_text())
+        cell = next(cell for cell in notebook['cells']
+                    if 'physics-correction' in cell.get('metadata', {}).get('tags', []))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'selected_alpha.json').write_text('{}')
+            selection = root / 'physics-corrector/selection.json'
+            for mode in ('off', 'train', 'predict'):
+                for use_source, use_checkpoint in ((False, False), (True, False), (True, True)):
+                    with self.subTest(mode=mode, source=use_source, checkpoint=use_checkpoint):
+                        runtime = SimpleNamespace(load_cache_checkpoint=Mock(return_value='verified'))
+                        corrector = SimpleNamespace(train_and_select=Mock(return_value=selection),
+                                                    load_selection=Mock())
+                        cache_source = root / 'previous/cache' if use_source else None
+                        checkpoint = root / 'previous/base.pt' if use_checkpoint else None
+                        namespace = dict(Path=Path, CORRECTOR_MODE=mode, CORRECTOR_SELECTION=selection,
+                            USE_RETRIEVAL=False, MAGINET_DIR=root, MAGINET_CHECKPOINT=root / 'base.pt',
+                            MAGINET_CACHE_SOURCE=cache_source, TASK1_CACHE_CHECKPOINT=checkpoint,
+                            RELEASE=root / 'release', CACHE_DIR=root / 'cache', CPU_THREADS=2,
+                            panel_args=[], selected_panels=['P_N'], CORRECTOR_EPOCHS=10,
+                            CORRECTOR_STEPS_PER_GROUP=4, SEED=42, RUN_FEBRUARY=False,
+                            maginet=runtime, physics_corrector=corrector, call_maginet=Mock(),
+                            pd=SimpleNamespace(read_csv=Mock()), display=Mock())
+                        exec(''.join(cell['source']), namespace)
+                        namespace['call_maginet'].assert_not_called()
+                        if mode == 'off':
+                            self.assertIsNone(namespace['ACTIVE_CORRECTOR_SELECTION'])
+                            runtime.load_cache_checkpoint.assert_not_called()
+                            corrector.train_and_select.assert_not_called()
+                            corrector.load_selection.assert_not_called()
+                            continue
+                        self.assertEqual(namespace['ACTIVE_CORRECTOR_SELECTION'], selection)
+                        self.assertEqual(runtime.CACHE_SOURCE_DIR, cache_source)
+                        self.assertEqual(runtime.CACHE_MODE, 'reuse' if use_source else 'build')
+                        if use_checkpoint:
+                            runtime.load_cache_checkpoint.assert_called_once_with(checkpoint, cache_source)
+                            self.assertEqual(runtime.CACHE_CHECKPOINT, 'verified')
+                        else:
+                            runtime.load_cache_checkpoint.assert_not_called()
+                            self.assertIsNone(runtime.CACHE_CHECKPOINT)
+                        if mode == 'train':
+                            corrector.train_and_select.assert_called_once()
+                            corrector.load_selection.assert_not_called()
+                        else:
+                            corrector.load_selection.assert_called_once()
+                            corrector.train_and_select.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -135,7 +135,8 @@ class Task123Notebook(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(code.encode()).hexdigest(), nb["metadata"]["trafficflow"]["source_sha256"][name])
                 ast.parse(code)
                 embedded.append(name)
-        self.assertEqual(set(embedded), {"data", "fast_model", "learning", "historical_retrieval", "maginet", "run"})
+        self.assertEqual(set(embedded), {"data", "fast_model", "learning", "historical_retrieval",
+                                         "maginet", "run", "physics_corrector"})
         self.assertNotIn("google.colab", tagged("environment"))
         self.assertNotIn("git clone", tagged("environment"))
 
