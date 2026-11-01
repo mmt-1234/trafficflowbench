@@ -54,6 +54,10 @@ class Task123NotebookRegressions:
         exec(tagged('configuration', self.notebook), namespace)
         self.assertEqual(namespace['RUN_MODE'], 'train')
         self.assertIn('--queue-balanced', namespace['QUEUE_FLAGS'])
+        self.assertEqual(namespace['QUEUE_LABEL_MODE'], 'soft')
+        self.assertEqual(namespace['QUEUE_IOU_TARGET'], 'hard')
+        self.assertTrue(namespace['QUEUE_SELECTION_SPLIT'])
+        self.assertEqual(namespace['QUEUE_POLICY_SCOPE'], 'global')
         validation = next(node for node in ast.parse(tagged('environment', self.notebook)).body
                           if isinstance(node, ast.If) and ast.unparse(node.test).startswith('RUN_MODE not in'))
         validation = compile(ast.Module(body=[validation], type_ignores=[]), '<mode-validation>', 'exec')
@@ -131,7 +135,8 @@ class Task123NotebookRegressions:
                          aggregate_channels=lambda *a: (np.zeros((count, 3, 3)), None, None),
                          ramp_features=lambda *a: np.zeros((count, 3, 4)),
                          slice_day=lambda *a: None, queue_features=lambda *a: np.zeros((12, 3, 44)))
-        functions(embedded('learning', self.notebook), ['queue_examples', 'choose_queue_origins', 'stable_seed', 'iou'], namespace)
+        functions(embedded('learning', self.notebook), ['queue_examples', 'choose_queue_origins', 'stable_seed', 'iou',
+                                                      'confirmed_queue_clear'], namespace)
         context = dict(panel=panel, release=Path('/unused'), profile=None)
         samples = namespace['queue_examples'](context, Path('states_2031-01-01.parquet'), args, 'select')
         self.assertTrue(samples)
@@ -168,7 +173,8 @@ class Task123NotebookRegressions:
                          aggregate_channels=lambda *a: (np.zeros((count, 3, 3)), None, None),
                          ramp_features=lambda *a: np.zeros((count, 3, 4)),
                          slice_day=lambda *a: None, queue_features=lambda *a: np.zeros((12, 3, 44)))
-        functions(embedded('learning', self.notebook), ['queue_examples', 'choose_queue_origins', 'stable_seed', 'iou'], namespace)
+        functions(embedded('learning', self.notebook), ['queue_examples', 'choose_queue_origins', 'stable_seed', 'iou',
+                                                      'confirmed_queue_clear'], namespace)
         context = dict(panel=panel, release=Path('/unused'), profile=None, queue_target_nodes=np.array([0]))
         path = Path('states_2031-01-01.parquet')
         samples = namespace['queue_examples'](context, path, args, 'fit')
@@ -196,7 +202,7 @@ class Task123NotebookRegressions:
         import pandas as pd
         namespace = dict(np=np, pd=pd)
         functions(embedded('learning', self.notebook), ['queue_decisions', 'queue_policy_metrics', 'queue_metrics',
-                                         'family_mean', 'iou'], namespace)
+                                         'family_mean', 'iou', 'queue_error_masks', 'confirmed_queue_clear'], namespace)
         row = dict(panel='P_N', condition='onset', date='2031-01-01', origin='2031-01-01T01:00:00Z',
                    probability=np.array([[.2, .9]] * 6), truth=np.array([[True, False]] * 6),
                    valid=np.array([[True, False]] * 6), target_mask=np.ones((6, 2), bool),

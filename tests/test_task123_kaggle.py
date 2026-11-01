@@ -254,7 +254,15 @@ class Task123Notebook(unittest.TestCase):
                 self.assertTrue((ns["RELEASE"].parent / "processed_v2").is_dir())
                 self.assertFalse((release.parent / "processed_v2").exists())
                 self.assertTrue((ns["MAGINET_DIR"] / "retrieval/selected_retrieval.json").is_file())
-                self.assertTrue((ns["QUEUE_DIR"] / "calibration-public-v1/february_fixed.json").is_file())
+                self.assertTrue((ns["QUEUE_DIR"] / "calibration-public-v2/february_fixed.json").is_file())
+                selected_queue = json.loads(ns['QUEUE_SELECTION'].read_text())
+                self.assertEqual(selected_queue['calibration_period'], 'calibrate')
+                self.assertFalse(selected_queue['policy']['force_nonempty'])
+                cached_rows, cached_manifest = ns['learning'].collect_queue_probabilities(
+                    ns['QUEUE_CHECKPOINT'], ns['RELEASE'], 'calibrate', ns['QUEUE_CALIBRATION_DIR'],
+                    ns['VALIDATION_WINDOWS'], ns['QUEUE_VALIDATION_SEED'], ns['CPU_THREADS'])
+                self.assertEqual(cached_manifest['window_signature'], ns['january_manifest']['window_signature'])
+                self.assertTrue({'link_ids', 'queue_logit', 'history_logit', 'prior_logit'} <= set(cached_rows[0]))
                 self.assertFalse(ns["SUBMISSION_PATH"].exists())
                 for path in ns["STATE_FILES"] + ns["QUEUE_FILES"]:
                     frame = pd.read_csv(path, dtype=str)
@@ -265,7 +273,9 @@ class Task123Notebook(unittest.TestCase):
                 self.assertEqual(len(saved["feature_names"]), 44)
                 self.assertEqual(saved["model_config"]["queue_head"], "conditional")
                 self.assertTrue(saved["model_config"]["queue_future_prior"])
-                self.assertEqual(saved["training_args"]["queue_label_mode"], "sample")
+                self.assertEqual(saved["training_args"]["queue_label_mode"], "soft")
+                self.assertEqual(saved["training_args"]["queue_iou_target"], "hard")
+                self.assertTrue(saved["training_args"]["queue_selection_split"])
                 self.assertTrue(saved["training_args"]["queue_origin"])
 
                 # Same notebook cells resume both models, then generate fresh outputs.
