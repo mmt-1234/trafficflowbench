@@ -58,10 +58,10 @@ def fixture():
     return d, context, np.full((size, stations, 2), 2.5, np.float32)
 
 
-def statistics(width, bounds=(.1, .2), variance=(.01, .04), n_bound=.2, n_variance=.01):
+def statistics(width, bounds=(.1, .2), variance=(.01, .04), dn_bound=.2):
     return dict(mean=np.zeros(width).tolist(), std=np.ones(width).tolist(), fitted_period='fit',
                 projection={'P_N/0': dict(bounds=list(bounds), channel_mse=list(variance),
-                                         log_n_bound=n_bound, log_n_mse=n_variance)})
+                                         dn_bound=dn_bound)})
 
 
 class PhysicsCorrectorTests(unittest.TestCase):
@@ -103,7 +103,7 @@ class PhysicsCorrectorTests(unittest.TestCase):
         right = self.code['FEATURES'].index('speed_right_valid')
         self.assertEqual(x[3, 0, right], 0)
         features = len(self.code['FEATURES'])
-        model = self.code['FrozenStateCorrector'](statistics(features))
+        model = self.code['DeltaNTrajectoryCorrector'](statistics(features))
         projection = self.code['projection_inputs'](d, context, 'cpu')
         with torch.no_grad():
             for parameter in model.parameters():
@@ -118,7 +118,7 @@ class PhysicsCorrectorTests(unittest.TestCase):
         d, context, base = fixture()
         x, consecutive = self.code['correction_features'](d, context, base)
         width = len(self.code['FEATURES'])
-        model = self.code['FrozenStateCorrector'](statistics(width))
+        model = self.code['DeltaNTrajectoryCorrector'](statistics(width))
         args = (torch.tensor(x), torch.tensor(base), torch.tensor(d['target']), consecutive,
                 self.code['projection_inputs'](d, context, 'cpu'))
         torch.testing.assert_close(model(*args), args[1], rtol=0, atol=0)
@@ -154,8 +154,8 @@ class PhysicsCorrectorTests(unittest.TestCase):
 
     def test_link_projection_preserves_observed_stations_and_is_minimum_weighted_step(self):
         d, context, base = fixture()
-        config = statistics(len(self.code['FEATURES']), bounds=(100., 100.), n_bound=.1, n_variance=0.)
-        model = self.code['FrozenStateCorrector'](config)
+        config = statistics(len(self.code['FEATURES']), bounds=(100., 100.), dn_bound=.1)
+        model = self.code['DeltaNTrajectoryCorrector'](config)
         with torch.no_grad():
             model.net[-1].bias.fill_(1.)
         x, consecutive = self.code['correction_features'](d, context, base)
@@ -164,10 +164,13 @@ class PhysicsCorrectorTests(unittest.TestCase):
         torch.testing.assert_close(output[~torch.tensor(d['target'])], torch.tensor(base)[~torch.tensor(d['target'])], rtol=0, atol=0)
         before, _, _ = self.code['public_link_fields'](d, context, base)
         after, _, _ = self.code['public_link_fields'](d, context, output.detach().numpy())
-        n0 = before[3, 0, 1] / before[3, 0, 0]
-        expected = (n0 + 1) * np.exp(.1 * np.tanh(1.)) - 1
-        self.assertAlmostEqual(after[3, 0, 1] / after[3, 0, 0], expected, places=4)
-        step = output[3, 0].detach().numpy() - base[3, 0]
+        n0 = before[2, 0, 1] / before[2, 0, 0]
+        free = torch.tensor(d['target'].any(1))[:, None]
+        delta = self.code['bridge_count_corrections'](torch.full((6, 1), .1 * np.tanh(1.)),
+            torch.full((6, 1), torch.sigmoid(torch.tensor(1.)).item()), free)
+        expected = n0 + float(delta[2, 0])
+        self.assertAlmostEqual(after[2, 0, 1] / after[2, 0, 0], expected, places=4)
+        step = output[2, 0].detach().numpy() - base[2, 0]
         covariance = np.array(config['projection']['P_N/0']['channel_mse']) / [.54, .46]
         tangent = np.array([600 * context['lanes'][0], 25 * expected])
         tangent /= np.linalg.norm(tangent)
@@ -184,35 +187,57 @@ class PhysicsCorrectorTests(unittest.TestCase):
                 self.code['projection_inputs'](d, context, 'cpu'))
         steps = []
         for variance in ((1e-6, 1.), (1., 1e-6)):
-            model = self.code['FrozenStateCorrector'](statistics(len(self.code['FEATURES']),
-                bounds=(100., 100.), variance=variance, n_bound=.1, n_variance=0.))
+            model = self.code['DeltaNTrajectoryCorrector'](statistics(len(self.code['FEATURES']),
+                bounds=(100., 100.), variance=variance, dn_bound=.1))
             with torch.no_grad():
                 model.net[-1].bias.fill_(1.)
             steps.append((model(*args) - args[1]).abs()[args[2]].mean(0))
         self.assertLess(steps[0][0], steps[1][0])
         self.assertGreater(steps[0][1], steps[1][1])
 
-    def test_uncertain_count_target_shrinks_the_projection(self):
-        d, context, base = fixture()
-        x, consecutive = self.code['correction_features'](d, context, base)
-        args = (torch.tensor(x), torch.tensor(base), torch.tensor(d['target']), consecutive,
-                self.code['projection_inputs'](d, context, 'cpu'))
-        changes = []
-        for variance in (0., 1.):
-            model = self.code['FrozenStateCorrector'](statistics(len(self.code['FEATURES']),
-                bounds=(100., 100.), n_variance=variance))
-            with torch.no_grad():
-                model.net[-1].bias.fill_(1.)
-            changes.append((model(*args) - args[1]).square().sum().detach())
-        self.assertGreater(changes[0], changes[1])
+    def test_bridge_matches_dense_solve_has_gradients_and_respects_gaps(self):
+        solve = self.code['bridge_count_corrections']
+        for size in (1, 2, 7, 12):
+            torch.manual_seed(size)
+            residual = torch.randn(size - 1, 2, dtype=torch.float64, requires_grad=True)
+            weight = torch.rand_like(residual)
+            if size > 3:
+                weight[size // 2] = 0
+            free = torch.ones(size, 2, dtype=torch.bool)
+            free[0, 0] = False
+            free[-1, 0] = False
+            actual = solve(residual, weight, free)
+            expected = []
+            for link in range(2):
+                difference = torch.zeros(size - 1, size, dtype=torch.float64)
+                for i in range(size - 1):
+                    difference[i, i:i+2] = torch.tensor([-1., 1.])
+                matrix = .1 * torch.eye(size, dtype=torch.float64) + difference.T @ torch.diag(weight[:, link]) @ difference
+                rhs = difference.T @ (weight[:, link] * residual[:, link])
+                indices = torch.where(free[:, link])[0]
+                output = torch.zeros(size, dtype=torch.float64)
+                if len(indices):
+                    output = output.index_copy(0, indices, torch.linalg.solve(matrix[indices][:, indices], rhs[indices]))
+                expected.append(output)
+            torch.testing.assert_close(actual, torch.stack(expected, 1), rtol=1e-9, atol=1e-9)
+            if size > 1:
+                actual.square().sum().backward()
+                self.assertTrue(torch.isfinite(residual.grad).all())
+        r = torch.ones(5, 1)
+        w = torch.ones_like(r)
+        w[2] = 0
+        free = torch.ones(6, 1, dtype=torch.bool)
+        before = solve(r, w, free)
+        r[3:] = 100
+        torch.testing.assert_close(solve(r, w, free)[:3], before[:3])
 
     def test_saved_corrector_reloads_the_same_projection_and_rejects_old_features(self):
         d, context, base = fixture()
         saved_stats = statistics(len(self.code['FEATURES']))
-        model = self.code['FrozenStateCorrector'](saved_stats)
+        model = self.code['DeltaNTrajectoryCorrector'](saved_stats)
         with torch.no_grad():
             model.net[-1].bias.fill_(.5)
-        payload = dict(model=model.state_dict(), features=self.code['FEATURES'],
+        payload = dict(version=self.code['VERSION'], model=model.state_dict(), features=self.code['FEATURES'],
                        statistics=saved_stats, contract='test-v2')
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'corrector.pt'
@@ -262,8 +287,8 @@ class PhysicsCorrectorTests(unittest.TestCase):
             stats = self.code['fit_statistics'](entries, cache, 42)
             with tempfile.TemporaryDirectory() as directory:
                 folder = Path(directory)
-                self.code['train_variant']('physics', entries, entries, cache, stats,
-                    dict(seed=42, epochs=1, steps_per_group=1), 'training-test', folder)
+                self.code['train_trajectory'](entries, entries, cache, stats,
+                    dict(seed=42, epochs=1, steps_per_group=1, n_weight=.05, dn_weight=.03), 'training-test', folder)
                 loaded = self.code['load_corrector'](folder / 'best_State.pt', 'training-test', 'cpu')
                 self.assertGreater(float(loaded.net[-1].weight.detach().abs().sum()), 0.)
                 final = self.code['correct_day'](loaded, days[0], context, base, 1.)
@@ -282,8 +307,8 @@ class PhysicsCorrectorTests(unittest.TestCase):
                     d['target'][:] = True
                     d['visible'][..., :2] = False
                     base[..., 0], base[..., 1] = speed / 25, flow / 600
-                    model = self.code['FrozenStateCorrector'](statistics(len(self.code['FEATURES']),
-                        bounds=bounds, variance=(1., 1e-6), n_bound=2., n_variance=0.))
+                    model = self.code['DeltaNTrajectoryCorrector'](statistics(len(self.code['FEATURES']),
+                        bounds=bounds, variance=(1., 1e-6), dn_bound=2.))
                     with torch.no_grad():
                         model.net[-1].bias.fill_(1.)
                     x, consecutive = self.code['correction_features'](d, context, base)
@@ -299,6 +324,19 @@ class PhysicsCorrectorTests(unittest.TestCase):
                     else:
                         self.assertGreaterEqual(float(output[..., 0].detach().mean()) * 25, 1 - 1e-6)
 
+    def test_sparse_errors_keep_positive_scale_without_changing_dense_or_zero_cases(self):
+        scale = self.code['residual_scale']
+        sparse = np.r_[np.zeros(95), np.full(5, -5.)]
+        self.assertEqual(float(np.quantile(np.abs(sparse), .9)), 0.)
+        self.assertEqual(scale(sparse), 5.)
+        self.assertEqual(scale(np.zeros(20)), 0.)
+        self.assertEqual(scale([]), 0.)
+        dense = np.arange(-10., 10.)
+        self.assertEqual(scale(dense), float(np.quantile(np.abs(dense), .9)))
+        for value in (np.nan, np.inf):
+            with self.assertRaises(ValueError):
+                scale([value])
+
     def test_projection_statistics_are_fit_only_and_use_normalized_channel_errors(self):
         d, context, base = fixture()
         d['truth'] = base.copy()
@@ -307,11 +345,11 @@ class PhysicsCorrectorTests(unittest.TestCase):
         entry = dict(period='fit', date='2030-06-01', panel='P_N', regime=0)
         saved = self.code['fit_statistics']([entry], cache, 42)
         np.testing.assert_allclose(saved['projection']['P_N/0']['channel_mse'], [.04, .01], rtol=1e-5)
-        self.assertGreater(saved['projection']['P_N/0']['log_n_bound'], 0)
+        self.assertGreater(saved['projection']['P_N/0']['dn_bound'], 0)
         with self.assertRaises(ValueError):
             self.code['fit_statistics']([{**entry, 'date': '2031-01-01'}], cache, 42)
         with self.assertRaises(ValueError):
-            self.code['FrozenStateCorrector']({**saved, 'fitted_period': 'early'})
+            self.code['DeltaNTrajectoryCorrector']({**saved, 'fitted_period': 'early'})
 
     def test_correction_sees_the_final_blend_exactly_once(self):
         d, _, _ = fixture()
@@ -420,6 +458,97 @@ class KagglePhysicsCorrectorTests(PhysicsCorrectorTests):
                         else:
                             corrector.load_selection.assert_called_once()
                             corrector.train_and_select.assert_not_called()
+
+
+class TrajectoryCacheTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        source = embedded('physics_corrector')
+        names = {'link_mean_numpy', 'consecutive_five_minutes'}
+        helpers = definitions(embedded('maginet'), dict(np=np, pd=pd), names)
+        cls.helpers = SimpleNamespace(**{name: helpers[name] for name in names})
+        cls.code = definitions(source, dict(np=np, pd=pd, torch=torch, nn=nn, m=cls.helpers,
+                                           Path=Path, json=json, hashlib=hashlib,
+                                           SimpleNamespace=SimpleNamespace))
+
+    def test_runtime_change_invalidates_prediction_cache_and_saved_selection(self):
+        model = nn.Linear(1, 1)
+        runtime = SimpleNamespace(
+            DEVICE=torch.device('cpu'), USE_AMP=False, AMP_DTYPE=torch.float16,
+            resolve_release=Path, load_local_checkpoint=lambda *args: (model, {'P_N': {}}, {}),
+            checkpoint_folder=lambda path: path.parent, prediction_alpha=lambda *args: 1.,
+            file_digest=lambda path: 'base-checkpoint', tensor_context=lambda context: {},
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.dict(self.code, m=runtime):
+            checkpoint, release, cache_dir = (Path(directory) / name for name in ('base.pt', 'release', 'cache'))
+            first = self.code['open_base'](checkpoint, release, cache_dir)
+            first_cache, first_identity = first[3:]
+            selection = Path(directory) / 'selection.json'
+            selection.write_text(json.dumps(dict(
+                version=self.code['VERSION'], selected_on='2031-01-16~31', base=first_identity,
+                gamma=0., candidate='baseline', corrector=None,
+            )))
+            self.code['load_selection'](selection, checkpoint, release, cache_dir)
+            environments = [
+                (torch.device('cuda'), True, torch.float16, str(torch.__version__)),
+                (torch.device('cuda'), True, torch.bfloat16, str(torch.__version__)),
+                (torch.device('cpu'), False, torch.float16, 'different-pytorch-version'),
+            ]
+            identities = {self.code['digest'](first_identity)}
+            for device, amp, dtype, version in environments:
+                runtime.DEVICE, runtime.USE_AMP, runtime.AMP_DTYPE = device, amp, dtype
+                with patch.object(torch, '__version__', version):
+                    changed = self.code['open_base'](checkpoint, release, cache_dir)
+                    self.assertNotEqual(first_cache.folder, changed[3].folder)
+                    identity = self.code['digest'](changed[4])
+                    self.assertNotIn(identity, identities)
+                    identities.add(identity)
+                    with self.assertRaisesRegex(ValueError, '실행 환경'):
+                        self.code['load_selection'](selection, checkpoint, release, cache_dir)
+
+    def test_candidate_inputs_are_built_once_per_day_without_changing_predictions(self):
+        d, context, base = fixture()
+        d['ti'], d['si'] = np.nonzero(d['target'])
+        models = [self.code['DeltaNTrajectoryCorrector'](statistics(len(self.code['FEATURES'])))
+                  for _ in range(4)]
+        for index, model in enumerate(models):
+            with torch.no_grad():
+                model.net[-1].bias.fill_(.2 * (index - 1))
+        candidates = [('baseline', None, 0.)] + [
+            (f'model_{index}_g{gamma}', model, gamma)
+            for index, model in enumerate(models) for gamma in (.25, .5, 1.)]
+        expected = [self.code['correct_day'](model, d, context, base, gamma)[d['target']]
+                    for _, model, gamma in candidates]
+        received = []
+
+        def record_state(truth, prediction):
+            received.append(prediction.copy())
+            return dict(count=len(prediction))
+
+        def summarize(records):
+            frame = pd.DataFrame(records)
+            return frame, frame, frame
+
+        physical = SimpleNamespace(**vars(self.helpers), SCALE=np.array([25., 600.]),
+                                   state_totals=record_state, physics_totals=lambda *args: {},
+                                   summarize=summarize)
+        cache = SimpleNamespace(contexts={'P_N': context}, get=lambda entry: (d, base))
+        entries = [dict(panel='P_N', regime=0, date=date) for date in ('2031-01-01', '2031-01-02')]
+        features = Mock(wraps=self.code['correction_features'])
+        projection = Mock(wraps=self.code['projection_inputs'])
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+                self.code, m=physical, correction_features=features, projection_inputs=projection):
+            self.code['score_candidates'](entries, cache, candidates, Path(directory), 'early')
+            self.assertEqual(features.call_count, len(entries))
+            self.assertEqual(projection.call_count, len(entries))
+            self.assertEqual(len(received), len(entries) * len(candidates))
+            for index, prediction in enumerate(received):
+                np.testing.assert_array_equal(prediction, expected[index % len(candidates)] * physical.SCALE)
+            features.reset_mock()
+            projection.reset_mock()
+            self.code['score_candidates'](entries, cache, candidates[:1], Path(directory), 'baseline')
+            features.assert_not_called()
+            projection.assert_not_called()
 
 
 if __name__ == '__main__':

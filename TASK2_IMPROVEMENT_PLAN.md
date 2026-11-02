@@ -1,4 +1,22 @@
-# Task 2 v5 개선안과 실행 방법
+# Task 2 v6 전환 디코더와 prior 게이트
+
+구현 확인일: 2026-11-02.
+
+새 학습의 기본 tag는 `transition-gated-v6`입니다. 기존 Queue 인코더를 재사용하고, 그래프 순환 디코더가 각 시점의 정체 발생·해소 확률을 예측합니다. 정체 확률은 `p_next = p*(1-clear) + (1-p)*onset`으로 갱신합니다. 12개 이력은 T-5에서 T를 거쳐 T+5를 예측하고, 공개 T를 포함한 13개 이력은 바로 T+5를 예측합니다.
+
+- `--queue-head transition`: 새 디코더입니다. 기존 `conditional`은 비교·이전 모델 로딩용으로 유지합니다.
+- `--queue-transition-weight 0.1`: 인접한 두 미래 라벨이 모두 적격인 경우에만 발생·해소를 추가 학습합니다. 보이지 않는 T의 정답은 요구하지 않습니다.
+- `--queue-teacher-start 0.5`: 학습 초기에는 이전 미래 정답을 일부 사용하고 최초 학습 예산의 마지막 epoch까지 비율을 0으로 줄입니다. 감소 기간은 `queue_teacher_epochs`로 체크포인트에 저장해 재개 시 총 epoch 예산을 늘려도 유지하며, 구형 v6는 저장된 최초 `epochs`를 사용합니다. 검증·제출 추론에서는 자기 예측만 사용합니다.
+- `--queue-prior-gate`: 이력 표현과 미래 시각·fit 평균으로 prior 가중치를 계산합니다.
+- `--queue-prior-dropout 0.2`: 학습 중 창 단위로 prior를 끄며, 검증·추론에서는 끄지 않습니다.
+
+새 구조는 `RESUME=False`와 별도 tag로 학습합니다. `QUEUE_INIT_CHECKPOINT`에는 기존 conditional/pooled-mlp 모델도 지정할 수 있으며 인코더와 호환되는 prior만 가져오고 새 디코더를 학습합니다. 같은 v6 모델에서는 디코더도 복사합니다. `RESUME=True`는 저장된 gate/dropout/전환 손실/teacher 설정을 복원하며 설정 변경을 거부합니다.
+
+기존 모델과 비교할 때는 tag를 분리하고, 기존 `QUEUE_FLAGS`의 conditional 구조와 v5 손실·표본 조건을 대조군으로 사용합니다. 새 디코더만 먼저 비교하려면 gate/dropout을 끄고, 그 뒤 gate를 추가합니다. 검증 날짜·마스크·라벨은 기존 공통 manifest로 맞춥니다. 학습 시작 모델과 update 수를 맞추며 실제 데이터에서 성능·시간은 미측정입니다.
+
+v5의 soft-BCE/hard-IoU, 해소창 보강, 1월 전반 epoch 선택·후반 임계값 선택, 전역 정책과 진단 파일은 유지합니다. 아래는 그 기반 레시피와 이전 분석 기록입니다.
+
+## v5 기반 레시피와 이전 분석
 
 구현 확인일: 2026-11-01.
 

@@ -198,7 +198,9 @@ class Task2V5Tests(unittest.TestCase):
                      queue_validation_seed=17, queue_policy_scope='global')
         restored = types.SimpleNamespace()
         self.learning.queue_recipe(restored, dict(training_args=saved))
-        self.assertEqual(vars(restored), saved)
+        self.assertEqual({k: getattr(restored, k) for k in saved}, saved)
+        self.assertFalse(restored.queue_prior_gate)
+        self.assertEqual(restored.queue_transition_weight, 0.)
         with self.assertRaisesRegex(ValueError, 'Resume must retain'):
             self.learning.queue_recipe(types.SimpleNamespace(queue_clear_fraction=0.), dict(training_args=saved))
 
