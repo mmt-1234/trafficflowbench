@@ -79,6 +79,12 @@ class Task123NotebookRegressions:
         self.assertEqual(namespace['MAGINET_DIR'], results / 'maginet' / (namespace['MAGINET_EXPERIMENT'] + '-current003'))
         self.assertEqual(namespace['QUEUE_CHECKPOINT'], results / 'queue' / (namespace['QUEUE_TAG'] + '-' + namespace['QUEUE_BACKEND']) / 'queue.pt')
         self.assertEqual(namespace['CACHE_DIR'], namespace['WORK_ROOT'] / 'cache/maginet')
+        if namespace.get('TASK1_CACHE_CHECKPOINT') is not None:
+            cache = Path(namespace['TASK1_CACHE_ROOT'])
+            previous = cache.parent.parent if cache.name == 'maginet' else cache.parent
+            expected = (previous / 'reports/full/maginet' /
+                        (namespace['MAGINET_EXPERIMENT'] + '-current003') / 'full/best_maginet.pt')
+            self.assertEqual(Path(namespace['TASK1_CACHE_CHECKPOINT']), expected)
         train = tagged('train-state', self.notebook)
         self.assertIn('MAGINET_DIR / "full" / "best_maginet.pt"', train)
         lwr = tagged('lwr-reconstruction', self.notebook)
