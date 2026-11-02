@@ -1,4 +1,4 @@
-"""Contracts for the frozen Task 1/3 corrector, without real release data."""
+"""Contracts for the Task 1/3 Delta-N trajectory, without real release data."""
 import ast
 import hashlib
 import json
@@ -31,7 +31,7 @@ def definitions(source, namespace, names=None):
         elif isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in
                 ('VERSION', 'GAMMAS', 'ENDPOINT_NAMES', 'FEATURES') for t in node.targets):
             selected.append(node)
-    exec(compile(ast.Module(body=selected, type_ignores=[]), '<corrector-contract>', 'exec'), namespace)
+    exec(compile(ast.Module(body=selected, type_ignores=[]), '<trajectory-contract>', 'exec'), namespace)
     return namespace
 
 
@@ -64,7 +64,7 @@ def statistics(width, bounds=(.1, .2), variance=(.01, .04), dn_bound=.2):
                                          dn_bound=dn_bound)})
 
 
-class PhysicsCorrectorTests(unittest.TestCase):
+class LwrTrajectoryTests(unittest.TestCase):
     notebook = NOTEBOOK
 
     @classmethod
@@ -73,13 +73,13 @@ class PhysicsCorrectorTests(unittest.TestCase):
                               {'link_mean_numpy', 'consecutive_five_minutes', 'final_state_output'})
         cls.m = SimpleNamespace(**{name: helpers[name] for name in
                                   ('link_mean_numpy', 'consecutive_five_minutes', 'final_state_output')})
-        cls.code = definitions(embedded('physics_corrector', cls.notebook),
+        cls.code = definitions(embedded('lwr_trajectory', cls.notebook),
                                dict(np=np, pd=pd, torch=torch, nn=nn, m=cls.m, Path=Path,
                                     json=json, hashlib=hashlib))
 
     def test_features_ignore_labels_and_hidden_placeholders(self):
         d, context, base = fixture()
-        build = self.code['correction_features']
+        build = self.code['trajectory_features']
         before, _ = build(d, context, base)
         d['truth'][:] = np.nan
         d['observed'][:] = -999
@@ -99,11 +99,11 @@ class PhysicsCorrectorTests(unittest.TestCase):
     def test_endpoints_and_convolution_do_not_cross_a_timestamp_gap(self):
         d, context, base = fixture()
         d['timestamps'][4:] = pd.date_range('2030-06-01T02:00Z', periods=3, freq='5min').astype(str).tolist()
-        x, consecutive = self.code['correction_features'](d, context, base)
+        x, consecutive = self.code['trajectory_features'](d, context, base)
         right = self.code['FEATURES'].index('speed_right_valid')
         self.assertEqual(x[3, 0, right], 0)
         features = len(self.code['FEATURES'])
-        model = self.code['DeltaNTrajectoryCorrector'](statistics(features))
+        model = self.code['DeltaNTrajectory'](statistics(features))
         projection = self.code['projection_inputs'](d, context, 'cpu')
         with torch.no_grad():
             for parameter in model.parameters():
@@ -116,9 +116,9 @@ class PhysicsCorrectorTests(unittest.TestCase):
 
     def test_zero_initialization_bounds_and_target_mask(self):
         d, context, base = fixture()
-        x, consecutive = self.code['correction_features'](d, context, base)
+        x, consecutive = self.code['trajectory_features'](d, context, base)
         width = len(self.code['FEATURES'])
-        model = self.code['DeltaNTrajectoryCorrector'](statistics(width))
+        model = self.code['DeltaNTrajectory'](statistics(width))
         args = (torch.tensor(x), torch.tensor(base), torch.tensor(d['target']), consecutive,
                 self.code['projection_inputs'](d, context, 'cpu'))
         torch.testing.assert_close(model(*args), args[1], rtol=0, atol=0)
@@ -138,27 +138,27 @@ class PhysicsCorrectorTests(unittest.TestCase):
             setattr(context['panel'], name, np.repeat(getattr(context['panel'], name), 2))
         context['mapping'] = np.array([0, 1])
         names = self.code['FEATURES']
-        before, _ = self.code['correction_features'](d, context, base)
+        before, _ = self.code['trajectory_features'](d, context, base)
         np.testing.assert_allclose(before[:, 0, names.index('neighbor_speed')], d['values'][:, 1, 0])
         self.assertTrue(before[:, 0, names.index('neighbor_speed_valid')].all())
         d['values'][3, 0, 2] = .7
         d['visible'][:, 1, 0] = False
         d['values'][:, 1, 0] = 99999
-        after, _ = self.code['correction_features'](d, context, base)
+        after, _ = self.code['trajectory_features'](d, context, base)
         self.assertAlmostEqual(after[3, 0, names.index('occupancy')], .7)
         self.assertFalse(after[:, 0, names.index('neighbor_speed_valid')].any())
         self.assertFalse(after[:, 0, names.index('neighbor_speed')].any())
         d['visible'][3, 0, 2] = False
-        masked, _ = self.code['correction_features'](d, context, base)
+        masked, _ = self.code['trajectory_features'](d, context, base)
         self.assertEqual(masked[3, 0, names.index('occupancy')], 0.)
 
     def test_link_projection_preserves_observed_stations_and_is_minimum_weighted_step(self):
         d, context, base = fixture()
         config = statistics(len(self.code['FEATURES']), bounds=(100., 100.), dn_bound=.1)
-        model = self.code['DeltaNTrajectoryCorrector'](config)
+        model = self.code['DeltaNTrajectory'](config)
         with torch.no_grad():
             model.net[-1].bias.fill_(1.)
-        x, consecutive = self.code['correction_features'](d, context, base)
+        x, consecutive = self.code['trajectory_features'](d, context, base)
         output = model(torch.tensor(x), torch.tensor(base), torch.tensor(d['target']), consecutive,
                        self.code['projection_inputs'](d, context, 'cpu'))
         torch.testing.assert_close(output[~torch.tensor(d['target'])], torch.tensor(base)[~torch.tensor(d['target'])], rtol=0, atol=0)
@@ -166,7 +166,7 @@ class PhysicsCorrectorTests(unittest.TestCase):
         after, _, _ = self.code['public_link_fields'](d, context, output.detach().numpy())
         n0 = before[2, 0, 1] / before[2, 0, 0]
         free = torch.tensor(d['target'].any(1))[:, None]
-        delta = self.code['bridge_count_corrections'](torch.full((6, 1), .1 * np.tanh(1.)),
+        delta = self.code['solve_delta_residuals'](torch.full((6, 1), .1 * np.tanh(1.)),
             torch.full((6, 1), torch.sigmoid(torch.tensor(1.)).item()), free)
         expected = n0 + float(delta[2, 0])
         self.assertAlmostEqual(after[2, 0, 1] / after[2, 0, 0], expected, places=4)
@@ -177,17 +177,17 @@ class PhysicsCorrectorTests(unittest.TestCase):
         cost = lambda delta: np.sum(delta**2 / covariance)
         for amount in (-.1, .1):
             self.assertGreater(cost(step + amount * tangent), cost(step))
-        torch.testing.assert_close(torch.tensor(self.code['correct_day'](model, d, context, base, 1.)),
+        torch.testing.assert_close(torch.tensor(self.code['reconstruct_day'](model, d, context, base, 1.)),
                                    output.detach(), rtol=0, atol=0)
 
     def test_reliability_protects_the_more_accurate_channel(self):
         d, context, base = fixture()
-        x, consecutive = self.code['correction_features'](d, context, base)
+        x, consecutive = self.code['trajectory_features'](d, context, base)
         args = (torch.tensor(x), torch.tensor(base), torch.tensor(d['target']), consecutive,
                 self.code['projection_inputs'](d, context, 'cpu'))
         steps = []
         for variance in ((1e-6, 1.), (1., 1e-6)):
-            model = self.code['DeltaNTrajectoryCorrector'](statistics(len(self.code['FEATURES']),
+            model = self.code['DeltaNTrajectory'](statistics(len(self.code['FEATURES']),
                 bounds=(100., 100.), variance=variance, dn_bound=.1))
             with torch.no_grad():
                 model.net[-1].bias.fill_(1.)
@@ -196,7 +196,7 @@ class PhysicsCorrectorTests(unittest.TestCase):
         self.assertGreater(steps[0][1], steps[1][1])
 
     def test_bridge_matches_dense_solve_has_gradients_and_respects_gaps(self):
-        solve = self.code['bridge_count_corrections']
+        solve = self.code['solve_delta_residuals']
         for size in (1, 2, 7, 12):
             torch.manual_seed(size)
             residual = torch.randn(size - 1, 2, dtype=torch.float64, requires_grad=True)
@@ -231,24 +231,24 @@ class PhysicsCorrectorTests(unittest.TestCase):
         r[3:] = 100
         torch.testing.assert_close(solve(r, w, free)[:3], before[:3])
 
-    def test_saved_corrector_reloads_the_same_projection_and_rejects_old_features(self):
+    def test_saved_trajectory_reloads_the_same_projection_and_rejects_old_features(self):
         d, context, base = fixture()
         saved_stats = statistics(len(self.code['FEATURES']))
-        model = self.code['DeltaNTrajectoryCorrector'](saved_stats)
+        model = self.code['DeltaNTrajectory'](saved_stats)
         with torch.no_grad():
             model.net[-1].bias.fill_(.5)
         payload = dict(version=self.code['VERSION'], model=model.state_dict(), features=self.code['FEATURES'],
-                       statistics=saved_stats, contract='test-v2')
+                       statistics=saved_stats, contract='test-v3')
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'corrector.pt'
+            path = Path(directory) / 'trajectory.pt'
             torch.save(payload, path)
-            loaded = self.code['load_corrector'](path, 'test-v2', 'cpu')
-            np.testing.assert_array_equal(self.code['correct_day'](model, d, context, base, 1.),
-                                          self.code['correct_day'](loaded, d, context, base, 1.))
+            loaded = self.code['load_trajectory'](path, 'test-v3', 'cpu')
+            np.testing.assert_array_equal(self.code['reconstruct_day'](model, d, context, base, 1.),
+                                          self.code['reconstruct_day'](loaded, d, context, base, 1.))
             payload['features'] = ['old-v1-feature']
             torch.save(payload, path)
             with self.assertRaises(ValueError):
-                self.code['load_corrector'](path, 'test-v2', 'cpu')
+                self.code['load_trajectory'](path, 'test-v3', 'cpu')
 
     def test_training_uses_final_state_and_count_losses_then_reloads(self):
         names = {'link_mean_numpy', 'consecutive_five_minutes', 'observability_mask', 'completed_link_fields',
@@ -289,9 +289,9 @@ class PhysicsCorrectorTests(unittest.TestCase):
                 folder = Path(directory)
                 self.code['train_trajectory'](entries, entries, cache, stats,
                     dict(seed=42, epochs=1, steps_per_group=1, n_weight=.05, dn_weight=.03), 'training-test', folder)
-                loaded = self.code['load_corrector'](folder / 'best_State.pt', 'training-test', 'cpu')
+                loaded = self.code['load_trajectory'](folder / 'best_State.pt', 'training-test', 'cpu')
                 self.assertGreater(float(loaded.net[-1].weight.detach().abs().sum()), 0.)
-                final = self.code['correct_day'](loaded, days[0], context, base, 1.)
+                final = self.code['reconstruct_day'](loaded, days[0], context, base, 1.)
                 self.assertTrue(np.isfinite(final).all())
                 history = pd.read_csv(folder / 'history.csv')
                 self.assertEqual(int(history.updates.iloc[0]), 3)
@@ -307,11 +307,11 @@ class PhysicsCorrectorTests(unittest.TestCase):
                     d['target'][:] = True
                     d['visible'][..., :2] = False
                     base[..., 0], base[..., 1] = speed / 25, flow / 600
-                    model = self.code['DeltaNTrajectoryCorrector'](statistics(len(self.code['FEATURES']),
+                    model = self.code['DeltaNTrajectory'](statistics(len(self.code['FEATURES']),
                         bounds=bounds, variance=(1., 1e-6), dn_bound=2.))
                     with torch.no_grad():
                         model.net[-1].bias.fill_(1.)
-                    x, consecutive = self.code['correction_features'](d, context, base)
+                    x, consecutive = self.code['trajectory_features'](d, context, base)
                     output = model(torch.tensor(x), torch.tensor(base), torch.tensor(d['target']), consecutive,
                                    self.code['projection_inputs'](d, context, 'cpu'))
                     self.assertTrue(torch.isfinite(output).all())
@@ -349,7 +349,7 @@ class PhysicsCorrectorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.code['fit_statistics']([{**entry, 'date': '2031-01-01'}], cache, 42)
         with self.assertRaises(ValueError):
-            self.code['DeltaNTrajectoryCorrector']({**saved, 'fitted_period': 'early'})
+            self.code['DeltaNTrajectory']({**saved, 'fitted_period': 'early'})
 
     def test_correction_sees_the_final_blend_exactly_once(self):
         d, _, _ = fixture()
@@ -394,7 +394,7 @@ class PhysicsCorrectorTests(unittest.TestCase):
         validate([dict(period='fit', date='2030-12-31')], 'fit')
 
 
-class KagglePhysicsCorrectorTests(PhysicsCorrectorTests):
+class KaggleLwrTrajectoryTests(LwrTrajectoryTests):
     notebook = NOTEBOOK.with_name('task123_kaggle.ipynb')
 
     def test_selected_correction_reaches_both_submission_splits_after_blend(self):
@@ -411,39 +411,39 @@ class KagglePhysicsCorrectorTests(PhysicsCorrectorTests):
             self.assertEqual(call.args[:4], (contexts, base_model, tensors, .25))
             self.assertEqual(call.kwargs, dict(finalprocessors=callbacks))
 
-    def test_notebook_correction_preserves_kaggle_cache_policy(self):
+    def test_notebook_reconstruction_preserves_kaggle_cache_policy(self):
         notebook = json.loads(self.notebook.read_text())
         cell = next(cell for cell in notebook['cells']
-                    if 'physics-correction' in cell.get('metadata', {}).get('tags', []))
+                    if 'lwr-reconstruction' in cell.get('metadata', {}).get('tags', []))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'selected_alpha.json').write_text('{}')
-            selection = root / 'physics-corrector/selection.json'
+            selection = root / 'lwr-trajectory/selection.json'
             for mode in ('off', 'train', 'predict'):
                 for use_source, use_checkpoint in ((False, False), (True, False), (True, True)):
                     with self.subTest(mode=mode, source=use_source, checkpoint=use_checkpoint):
                         runtime = SimpleNamespace(load_cache_checkpoint=Mock(return_value='verified'))
-                        corrector = SimpleNamespace(train_and_select=Mock(return_value=selection),
+                        trajectory = SimpleNamespace(train_and_select=Mock(return_value=selection),
                                                     load_selection=Mock())
                         cache_source = root / 'previous/cache' if use_source else None
                         checkpoint = root / 'previous/base.pt' if use_checkpoint else None
-                        namespace = dict(Path=Path, CORRECTOR_MODE=mode, CORRECTOR_SELECTION=selection,
+                        namespace = dict(Path=Path, LWR_MODE=mode, LWR_SELECTION=selection,
                             USE_RETRIEVAL=False, MAGINET_DIR=root, MAGINET_CHECKPOINT=root / 'base.pt',
                             MAGINET_CACHE_SOURCE=cache_source, TASK1_CACHE_CHECKPOINT=checkpoint,
                             RELEASE=root / 'release', CACHE_DIR=root / 'cache', CPU_THREADS=2,
-                            panel_args=[], selected_panels=['P_N'], CORRECTOR_EPOCHS=10,
-                            CORRECTOR_STEPS_PER_GROUP=4, SEED=42, RUN_FEBRUARY=False,
-                            maginet=runtime, physics_corrector=corrector, call_maginet=Mock(),
+                            panel_args=[], selected_panels=['P_N'], LWR_EPOCHS=10,
+                            LWR_STEPS_PER_GROUP=4, SEED=42, RUN_FEBRUARY=False,
+                            maginet=runtime, lwr_trajectory=trajectory, call_maginet=Mock(),
                             pd=SimpleNamespace(read_csv=Mock()), display=Mock())
                         exec(''.join(cell['source']), namespace)
                         namespace['call_maginet'].assert_not_called()
                         if mode == 'off':
-                            self.assertIsNone(namespace['ACTIVE_CORRECTOR_SELECTION'])
+                            self.assertIsNone(namespace['ACTIVE_LWR_SELECTION'])
                             runtime.load_cache_checkpoint.assert_not_called()
-                            corrector.train_and_select.assert_not_called()
-                            corrector.load_selection.assert_not_called()
+                            trajectory.train_and_select.assert_not_called()
+                            trajectory.load_selection.assert_not_called()
                             continue
-                        self.assertEqual(namespace['ACTIVE_CORRECTOR_SELECTION'], selection)
+                        self.assertEqual(namespace['ACTIVE_LWR_SELECTION'], selection)
                         self.assertEqual(runtime.CACHE_SOURCE_DIR, cache_source)
                         self.assertEqual(runtime.CACHE_MODE, 'reuse' if use_source else 'build')
                         if use_checkpoint:
@@ -453,17 +453,17 @@ class KagglePhysicsCorrectorTests(PhysicsCorrectorTests):
                             runtime.load_cache_checkpoint.assert_not_called()
                             self.assertIsNone(runtime.CACHE_CHECKPOINT)
                         if mode == 'train':
-                            corrector.train_and_select.assert_called_once()
-                            corrector.load_selection.assert_not_called()
+                            trajectory.train_and_select.assert_called_once()
+                            trajectory.load_selection.assert_not_called()
                         else:
-                            corrector.load_selection.assert_called_once()
-                            corrector.train_and_select.assert_not_called()
+                            trajectory.load_selection.assert_called_once()
+                            trajectory.train_and_select.assert_not_called()
 
 
 class TrajectoryCacheTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        source = embedded('physics_corrector')
+        source = embedded('lwr_trajectory')
         names = {'link_mean_numpy', 'consecutive_five_minutes'}
         helpers = definitions(embedded('maginet'), dict(np=np, pd=pd), names)
         cls.helpers = SimpleNamespace(**{name: helpers[name] for name in names})
@@ -486,7 +486,7 @@ class TrajectoryCacheTests(unittest.TestCase):
             selection = Path(directory) / 'selection.json'
             selection.write_text(json.dumps(dict(
                 version=self.code['VERSION'], selected_on='2031-01-16~31', base=first_identity,
-                gamma=0., candidate='baseline', corrector=None,
+                gamma=0., candidate='baseline', trajectory=None,
             )))
             self.code['load_selection'](selection, checkpoint, release, cache_dir)
             environments = [
@@ -509,7 +509,7 @@ class TrajectoryCacheTests(unittest.TestCase):
     def test_candidate_inputs_are_built_once_per_day_without_changing_predictions(self):
         d, context, base = fixture()
         d['ti'], d['si'] = np.nonzero(d['target'])
-        models = [self.code['DeltaNTrajectoryCorrector'](statistics(len(self.code['FEATURES'])))
+        models = [self.code['DeltaNTrajectory'](statistics(len(self.code['FEATURES'])))
                   for _ in range(4)]
         for index, model in enumerate(models):
             with torch.no_grad():
@@ -517,7 +517,7 @@ class TrajectoryCacheTests(unittest.TestCase):
         candidates = [('baseline', None, 0.)] + [
             (f'model_{index}_g{gamma}', model, gamma)
             for index, model in enumerate(models) for gamma in (.25, .5, 1.)]
-        expected = [self.code['correct_day'](model, d, context, base, gamma)[d['target']]
+        expected = [self.code['reconstruct_day'](model, d, context, base, gamma)[d['target']]
                     for _, model, gamma in candidates]
         received = []
 
@@ -534,10 +534,10 @@ class TrajectoryCacheTests(unittest.TestCase):
                                    summarize=summarize)
         cache = SimpleNamespace(contexts={'P_N': context}, get=lambda entry: (d, base))
         entries = [dict(panel='P_N', regime=0, date=date) for date in ('2031-01-01', '2031-01-02')]
-        features = Mock(wraps=self.code['correction_features'])
+        features = Mock(wraps=self.code['trajectory_features'])
         projection = Mock(wraps=self.code['projection_inputs'])
         with tempfile.TemporaryDirectory() as directory, patch.dict(
-                self.code, m=physical, correction_features=features, projection_inputs=projection):
+                self.code, m=physical, trajectory_features=features, projection_inputs=projection):
             self.code['score_candidates'](entries, cache, candidates, Path(directory), 'early')
             self.assertEqual(features.call_count, len(entries))
             self.assertEqual(projection.call_count, len(entries))

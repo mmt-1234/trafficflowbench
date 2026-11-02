@@ -563,8 +563,8 @@ Queue 결과 폴더의 `calibration-public-v2/`에는 정책 비교표, 고정 �
 
 ### ΔN 궤적 복원
 
-통합 노트북의 `CORRECTOR_MODE="train"` 기본 실행은 `delta-n-trajectory-v3`를 학습합니다. 기존 시점별 N 보정층·state/physics 분기와 중복된 Kaggle 붙여넣기 셀을 제거했습니다. 새 모듈은 ΔN 잔차와 전환 신뢰도를 예측하고 공개 관측을 고정한 궤적을 복원한 뒤 속도·교통량에 공동 반영합니다. 시간 단절·관측 불가 링크는 연결하지 않으며, 통계는 fit 기간에서만 구합니다. ΔN·채널 잔차의 90백분위수가 0이어도 실제 오차가 남으면 양수 잔차의 백분위수로 대체해 학습이 차단되지 않게 합니다. 최종 속도·교통량으로 State·N·dN 손실을 계산합니다. 기존 MagiNet 체크포인트는 재사용하며 이전 N 보정 체크포인트는 다시 학습해야 합니다.
+통합 노트북의 `LWR_MODE="train"` 기본 실행은 `delta-n-trajectory-v3`를 학습합니다. 기존 시점별 N 보정층·state/physics 분기와 중복된 Kaggle 붙여넣기 셀을 제거했습니다. 새 모듈은 ΔN 잔차와 전환 신뢰도를 예측하고 공개 관측을 고정한 궤적을 복원한 뒤 속도·교통량에 공동 반영합니다. 시간 단절·관측 불가 링크는 연결하지 않으며, 통계는 fit 기간에서만 구합니다. ΔN·채널 잔차의 90백분위수가 0이어도 실제 오차가 남으면 양수 잔차의 백분위수로 대체해 학습이 차단되지 않게 합니다. 최종 속도·교통량으로 State·N·dN 손실을 계산합니다. 기존 MagiNet 체크포인트는 재사용하며 이전 N 보정 체크포인트는 다시 학습해야 합니다.
 
-결과는 `MAGINET_DIR/physics-corrector/<해시>/`에 저장됩니다. `comparison.csv`에는 최종 후보와 State/FD/N/DN/LWR 조건별 통과 여부, `selection.json`에는 적용 후보와 gamma, `blend_{macro,panel_regime,daily}.csv`에는 비교 결과, `trajectory/history.csv`에는 학습 이력이 있습니다. 조건을 통과한 후보가 없으면 baseline을 유지합니다. `CACHE_DIR/corrector/`는 보고서가 아닌 예측 캐시입니다. Task 2만 실행할 때는 `TASK2_ONLY=True`, `CORRECTOR_MODE="off"`로 지정합니다.
+결과는 `MAGINET_DIR/lwr-trajectory/<해시>/`에 저장됩니다. `comparison.csv`에는 최종 후보와 State/FD/N/DN/LWR 조건별 통과 여부, `selection.json`에는 적용 후보와 gamma, `blend_{macro,panel_regime,daily}.csv`에는 비교 결과, `trajectory/history.csv`에는 학습 이력이 있습니다. 조건을 통과한 후보가 없으면 baseline을 유지합니다. `CACHE_DIR/lwr-trajectory-predictions/`는 보고서가 아닌 예측 캐시입니다. Task 2만 실행할 때는 `TASK2_ONLY=True`로 지정하며 LWR 단계는 자동으로 건너뜁니다.
 
 2026-11-02 구현 기준 실제 데이터의 점수·학습 시간은 미측정입니다. Queue·LWR은 공개 관측 기반 대리 평가입니다.

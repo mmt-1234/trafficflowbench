@@ -142,7 +142,7 @@ class Task123Notebook(unittest.TestCase):
                 ast.parse(code)
                 embedded.append(name)
         self.assertEqual(set(embedded), {"data", "fast_model", "learning", "historical_retrieval",
-                                         "maginet", "run", "physics_corrector"})
+                                         "maginet", "run", "lwr_trajectory"})
         self.assertNotIn("google.colab", tagged("environment"))
         self.assertNotIn("git clone", tagged("environment"))
 

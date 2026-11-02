@@ -53,6 +53,24 @@ class Task123NotebookRegressions:
                                      notebook['metadata']['trafficflow']['source_sha256'][name])
                     compile(ast.parse(source), name, 'exec')
 
+    def test_lwr_has_only_trajectory_entry_points_and_safe_defaults(self):
+        namespace = {}
+        exec(tagged('configuration', self.notebook), namespace)
+        self.assertEqual(namespace['LWR_MODE'], 'train')
+        self.assertFalse(namespace['USE_RETRIEVAL'])
+        self.assertFalse(any(name.startswith('CORRECTOR_') for name in namespace))
+        notebook = json.loads(self.notebook.read_text())
+        text = '\n'.join(''.join(cell['source']) for cell in notebook['cells'])
+        self.assertNotIn('physics_corrector', text)
+        self.assertNotIn('CORRECTOR_', text)
+        self.assertIn('lwr_trajectory', text)
+        environment = ast.parse(tagged('environment', self.notebook))
+        skip = next(node for node in environment.body if isinstance(node, ast.If)
+                    and ast.unparse(node.test) == 'TASK2_ONLY')
+        scope = dict(TASK2_ONLY=True, LWR_MODE='train')
+        exec(compile(ast.Module(body=[skip], type_ignores=[]), '<queue-only-lwr>', 'exec'), scope)
+        self.assertEqual(scope['LWR_MODE'], 'off')
+
     def test_notebook_has_only_train_and_predict_modes(self):
         notebook = json.loads(self.notebook.read_text())
         self.assertNotIn('smoke', ''.join(''.join(cell['source']) for cell in notebook['cells']).lower())
