@@ -85,6 +85,9 @@ class Task123NotebookRegressions:
             expected = (previous / 'reports/full/maginet' /
                         (namespace['MAGINET_EXPERIMENT'] + '-current003') / 'full/best_maginet.pt')
             self.assertEqual(Path(namespace['TASK1_CACHE_CHECKPOINT']), expected)
+            if 'TASK1_PREVIOUS_RUN' in namespace:
+                self.assertEqual(cache, namespace['TASK1_PREVIOUS_RUN'] / 'cache')
+                self.assertEqual(previous, namespace['TASK1_PREVIOUS_RUN'])
         train = tagged('train-state', self.notebook)
         self.assertIn('MAGINET_DIR / "full" / "best_maginet.pt"', train)
         lwr = tagged('lwr-reconstruction', self.notebook)
