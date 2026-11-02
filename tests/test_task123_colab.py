@@ -38,6 +38,12 @@ def functions(source, names, namespace):
 class Task123NotebookRegressions:
     def test_cells_and_embedded_source_hashes(self):
         notebook = json.loads(self.notebook.read_text())
+        loader = ast.parse(tagged('module-loader', self.notebook))
+        runtime_hashes = ast.literal_eval(next(
+            node.value for node in loader.body if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == 'SOURCE_HASHES'
+                    for target in node.targets)))
+        self.assertEqual(runtime_hashes, notebook['metadata']['trafficflow']['source_sha256'])
         for index, cell in enumerate(notebook['cells']):
             if cell['cell_type'] == 'code':
                 tree = ast.parse(''.join(cell['source']), filename=f'cell-{index}')

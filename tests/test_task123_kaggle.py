@@ -124,6 +124,12 @@ class Task123Notebook(unittest.TestCase):
     def test_embedded_sources_are_pinned_and_all_cells_parse(self):
         nb = notebook()
         self.assertEqual(nb["metadata"]["trafficflow"]["source_commit"], COMMIT)
+        loader = ast.parse(tagged("module-loader"))
+        runtime_hashes = ast.literal_eval(next(
+            node.value for node in loader.body if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "SOURCE_HASHES"
+                    for target in node.targets)))
+        self.assertEqual(runtime_hashes, nb["metadata"]["trafficflow"]["source_sha256"])
         embedded = []
         for i, cell in enumerate(nb["cells"]):
             if cell["cell_type"] != "code":
