@@ -44,14 +44,49 @@ class Task123NotebookRegressions:
             and any(isinstance(target, ast.Name) and target.id == 'SOURCE_HASHES'
                     for target in node.targets)))
         self.assertEqual(runtime_hashes, notebook['metadata']['trafficflow']['source_sha256'])
+        loaded = []
+        for name, digest in runtime_hashes.items():
+            self.assertTrue(name.isidentifier())
+            self.assertEqual(len(digest), 64)
+            self.assertTrue(all(ch in '0123456789abcdef' for ch in digest))
         for index, cell in enumerate(notebook['cells']):
             if cell['cell_type'] == 'code':
                 tree = ast.parse(''.join(cell['source']), filename=f'cell-{index}')
                 if 'embedded-source' in cell.get('metadata', {}).get('tags', []):
                     name, source = (ast.literal_eval(arg) for arg in tree.body[0].value.args)
+                    self.assertIn(name, cell['metadata']['tags'])
+                    dependencies = [node.module for node in ast.parse(source).body if isinstance(node, ast.ImportFrom)
+                                    and node.module in runtime_hashes]
+                    self.assertTrue(set(dependencies) <= set(loaded))
+                    loaded.append(name)
                     self.assertEqual(hashlib.sha256(source.encode()).hexdigest(),
                                      notebook['metadata']['trafficflow']['source_sha256'][name])
                     compile(ast.parse(source), name, 'exec')
+        self.assertEqual(len(loaded), len(set(loaded)))
+        self.assertEqual(set(loaded), set(runtime_hashes))
+
+    def test_report_and_checkpoint_paths_share_the_configured_roots(self):
+        namespace = {}
+        exec(tagged('configuration', self.notebook), namespace)
+        # Read only path assignments; environment execution would access data and GPUs.
+        names = {'RESULTS', 'CACHE_DIR', 'MAGINET_DIR', 'RETRIEVAL_SELECTION', 'QUEUE_DIR', 'QUEUE_CHECKPOINT'}
+        for node in ast.parse(tagged('environment', self.notebook)).body:
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in names for t in node.targets):
+                namespace['EFFECTIVE_BACKEND'] = namespace['QUEUE_BACKEND']
+                exec(compile(ast.Module(body=[node], type_ignores=[]), '<notebook-paths>', 'exec'), namespace)
+        results = namespace.get('SAVE_ROOT', namespace['WORK_ROOT']) / 'reports/full'
+        self.assertEqual(namespace['RESULTS'], results)
+        self.assertEqual(namespace['MAGINET_DIR'], results / 'maginet' / (namespace['MAGINET_EXPERIMENT'] + '-current003'))
+        self.assertEqual(namespace['QUEUE_CHECKPOINT'], results / 'queue' / (namespace['QUEUE_TAG'] + '-' + namespace['QUEUE_BACKEND']) / 'queue.pt')
+        self.assertEqual(namespace['CACHE_DIR'], namespace['WORK_ROOT'] / 'cache/maginet')
+        train = tagged('train-state', self.notebook)
+        self.assertIn('MAGINET_DIR / "full" / "best_maginet.pt"', train)
+        lwr = tagged('lwr-reconstruction', self.notebook)
+        self.assertIn('MAGINET_DIR / "lwr-trajectory"', lwr)
+        implementation = embedded('lwr_trajectory', self.notebook)
+        self.assertIn("folder / 'trajectory' / f'best_{metric}.pt'", implementation)
+        self.assertIn("trajectory=str(path.relative_to(folder))", implementation)
+        self.assertIn("selection_path.parent / saved['trajectory']", implementation)
 
     def test_lwr_has_only_trajectory_entry_points_and_safe_defaults(self):
         namespace = {}
