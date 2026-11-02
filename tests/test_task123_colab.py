@@ -82,9 +82,10 @@ class Task123NotebookRegressions:
         if namespace.get('TASK1_CACHE_CHECKPOINT') is not None:
             cache = Path(namespace['TASK1_CACHE_ROOT'])
             previous = cache.parent.parent if cache.name == 'maginet' else cache.parent
-            expected = (previous / 'reports/full/maginet' /
-                        (namespace['MAGINET_EXPERIMENT'] + '-current003') / 'full/best_maginet.pt')
-            self.assertEqual(Path(namespace['TASK1_CACHE_CHECKPOINT']), expected)
+            checkpoint = Path(namespace['TASK1_CACHE_CHECKPOINT'])
+            self.assertEqual(checkpoint.parents[2], previous / 'reports/full/maginet')
+            self.assertEqual(checkpoint.parent.name, 'full')
+            self.assertEqual(checkpoint.name, 'best_maginet.pt')
             if 'TASK1_PREVIOUS_RUN' in namespace:
                 self.assertEqual(cache, namespace['TASK1_PREVIOUS_RUN'] / 'cache')
                 self.assertEqual(previous, namespace['TASK1_PREVIOUS_RUN'])
@@ -96,6 +97,22 @@ class Task123NotebookRegressions:
         self.assertIn("folder / 'trajectory' / f'best_{metric}.pt'", implementation)
         self.assertIn("trajectory=str(path.relative_to(folder))", implementation)
         self.assertIn("selection_path.parent / saved['trajectory']", implementation)
+
+    def test_previous_input_checkpoint_is_independent_of_new_experiment_name(self):
+        original = {}
+        configuration = tagged('configuration', self.notebook)
+        exec(configuration, original)
+        if original.get('TASK1_CACHE_CHECKPOINT') is None:
+            return
+        tree = ast.parse(configuration)
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'MAGINET_EXPERIMENT'
+                                                    for t in node.targets):
+                node.value = ast.Constant(value='fresh-output-experiment')
+        changed = {}
+        exec(compile(ast.fix_missing_locations(tree), '<new-experiment-input-path>', 'exec'), changed)
+        self.assertEqual(changed['TASK1_CACHE_CHECKPOINT'], original['TASK1_CACHE_CHECKPOINT'])
+        self.assertEqual(changed['TASK1_CACHE_ROOT'], original['TASK1_CACHE_ROOT'])
 
     def test_lwr_has_only_trajectory_entry_points_and_safe_defaults(self):
         namespace = {}
